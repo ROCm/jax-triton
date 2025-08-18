@@ -17,6 +17,8 @@ def softmax_kernel(input_ptr, output_ptr,
     # starting row of the program
     row_start = tl.program_id(0)
     row_step = tl.num_programs(0)
+    # Each block processes rows with a step size of num_blocks for load balancing,
+    # while vectorizing column operations within each row.
     for row_idx in tl.range(row_start, n_rows, row_step):
         # The stride represents how much we need to increase the pointer to advance 1 row
         row_start_ptr = input_ptr + row_idx * input_row_stride
@@ -49,8 +51,8 @@ def softmax(x: jnp.ndarray) -> jnp.ndarray:
     return jt.triton_call(
         x,  # Input array
         kernel=softmax_kernel,
-        grid=grid,
         out_shape=out_shape,
+        grid=grid,
         # Kernel parameters
         input_row_stride=strides[0],
         output_row_stride=strides[0],

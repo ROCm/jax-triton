@@ -35,8 +35,8 @@ def add(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
         x,
         y,
         kernel=add_kernel,
-        grid=grid,
         out_shape=out_shape,
+        grid=grid,
         n_elements=n_elements,
         BLOCK_SIZE=BLOCK_SIZE
     )

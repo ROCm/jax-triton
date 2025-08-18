@@ -39,7 +39,10 @@ def matmul_kernel(
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
+    # If `num_pid_m` isn't divisible by `GROUP_SIZE_M`, the last group is smaller
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    # *Within groups*, programs are ordered in a column-major order
+    # Row-id and col-id of the program in the *launch grid*
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
@@ -125,13 +128,15 @@ def matmul(a, b, activation=""):
     # 1D launch kernel where each block gets its own program.
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
     return jt.triton_call(
-        a,
+        a,  # Input arrays
         b,
         kernel=matmul_kernel,
-        grid=grid,
         out_shape=out_shape,
+        grid=grid,
+        # Execution configs
         num_warps=8,
         num_stages=3,
+        # Kernel parameters
         M=M,
         N=N,
         K=K,
