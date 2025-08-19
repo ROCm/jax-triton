@@ -63,7 +63,7 @@ def softmax(x: jnp.ndarray) -> jnp.ndarray:
 
 
 def main(unused_argv):
-    x_val = jnp.ones((8, 5), dtype="float32")
+    x_val = jnp.ones((1024, 512), dtype="float32")
     print(softmax(x_val).block_until_ready())
     print(jax.jit(softmax)(x_val).block_until_ready())
 
