@@ -2,30 +2,19 @@
 Layer Normalization
 """
 
-import torch
 import jax
 import jax.numpy as jnp
 import jax_triton as jt
 import triton
 import triton.language as tl
 
-try:
-    # This is https://github.com/NVIDIA/apex, NOT the apex on PyPi, so it
-    # should not be added to extras_require in setup.py.
-    import apex
-    HAS_APEX = True
-except ModuleNotFoundError:
-    HAS_APEX = False
-
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
 
 @triton.jit
 def _layer_norm_fwd_fused(
     X,  # pointer to the input
-    Y,  # pointer to the output
     W,  # pointer to the weights
     B,  # pointer to the biases
+    Y,  # pointer to the output
     Mean,  # pointer to the mean
     Rstd,  # pointer to the 1/std
     stride,  # how much to increase the pointer when moving by 1 row
@@ -35,8 +24,8 @@ def _layer_norm_fwd_fused(
 ):
     # Map the program id to the row of X and Y it should compute.
     row = tl.program_id(0)
-    Y += row * stride
     X += row * stride
+    Y += row * stride
     # Compute mean
     mean = 0
     _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
@@ -162,148 +151,127 @@ def _layer_norm_bwd_dwdb(DW,  # pointer to the partial sum of weights gradient
     tl.store(FINAL_DB + cols, sum_db, mask=cols < N)
 
 
-class LayerNorm(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, x, normalized_shape, weight, bias, eps):
-        out_shape = [
-            jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype),
-            jax.ShapeDtypeStruct(shape=(n_rows,), dtype=jnp.float32),
-            jax.ShapeDtypeStruct(shape=(n_rows,), dtype=jnp.float32)
-        ]
-        # reshape input data into 2D tensor
-        x_arg = x.reshape(-1, x.shape[-1])
-        M, N = x_arg.shape
-        # Less than 64KB per feature: enqueue fused kernel
-        MAX_FUSED_SIZE = 65536 // x.element_size()
-        BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
-        if N > BLOCK_SIZE:
-            raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-        grid = (M,)
-        # heuristics for number of warps
-        num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
-        # enqueue kernel
-        _layer_norm_fwd_fused[(M, )](  #
-            x_arg, y, weight, bias, mean, rstd,  #
-            x_arg.stride(0), N, eps,  #
-            BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps, num_ctas=1)
-        ctx.save_for_backward(x, weight, bias, mean, rstd)
-        ctx.BLOCK_SIZE = BLOCK_SIZE
-        ctx.num_warps = num_warps
-        ctx.eps = eps
-        return y
-
-    @staticmethod
-    def backward(ctx, dy):
-        x, w, b, m, v = ctx.saved_tensors
-        # heuristics for amount of parallel reduction stream for DW/DB
-        N = w.shape[0]
-        GROUP_SIZE_M = 64
-        if N <= 8192: GROUP_SIZE_M = 96
-        if N <= 4096: GROUP_SIZE_M = 128
-        if N <= 1024: GROUP_SIZE_M = 256
-        # allocate output
-        locks = torch.zeros(2 * GROUP_SIZE_M, dtype=torch.int32, device=w.device)
-        _dw = torch.zeros((GROUP_SIZE_M, N), dtype=x.dtype, device=w.device)
-        _db = torch.zeros((GROUP_SIZE_M, N), dtype=x.dtype, device=w.device)
-        dw = torch.empty((N, ), dtype=w.dtype, device=w.device)
-        db = torch.empty((N, ), dtype=w.dtype, device=w.device)
-        dx = torch.empty_like(dy)
-        # enqueue kernel using forward pass heuristics
-        # also compute partial sums for DW and DB
-        x_arg = x.reshape(-1, x.shape[-1])
-        M, N = x_arg.shape
-        _layer_norm_bwd_dx_fused[(M, )](  #
-            dx, dy, _dw, _db, x, w, m, v, locks,  #
-            x_arg.stride(0), N,  #
-            BLOCK_SIZE_N=ctx.BLOCK_SIZE,  #
-            GROUP_SIZE_M=GROUP_SIZE_M,  #
-            num_warps=ctx.num_warps)
-        grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE_N']), )
-        # accumulate partial sums in separate kernel
-        _layer_norm_bwd_dwdb[grid](
-            _dw, _db, dw, db, min(GROUP_SIZE_M, M), N,  #
-            BLOCK_SIZE_M=32,  #
-            BLOCK_SIZE_N=128, num_ctas=1)
-        return dx, None, dw, db, None
+def layer_norm_fwd(x, w, b, eps, BLOCK_SIZE):
+    # reshape input data into 2D tensor
+    x_2d = x.reshape(-1, x.shape[-1])
+    M, N = x_2d.shape
+    strides = jt.strides_from_shape(x_2d.shape)
+    # specify output data shape
+    out_shape = [
+        jax.ShapeDtypeStruct(shape=x_2d.shape, dtype=x_2d.dtype),
+        jax.ShapeDtypeStruct(shape=(M,), dtype=jnp.float32),
+        jax.ShapeDtypeStruct(shape=(M,), dtype=jnp.float32)
+    ]
+    grid = (M,)
+    # heuristics for number of warps
+    num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
+    # enqueue kernel
+    y, mean, rstd = jt.triton_call(
+        x_2d, w, b,
+        kernel=_layer_norm_fwd_fused,
+        out_shape=out_shape,
+        grid=grid,
+        stride=strides[0],
+        N=N,
+        eps=eps,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    saved_tensors_for_bwd = x, w, b, mean, rstd
+    return y, saved_tensors_for_bwd
 
 
-layer_norm = LayerNorm.apply
+def layer_norm_bwd(dy, saved_tensors_for_bwd, BLOCK_SIZE):
+    x, w, b, m, v = saved_tensors_for_bwd
+    # reshape input data into 2D tensor
+    x_2d = x.reshape(-1, x.shape[-1])
+    M, N = x_2d.shape
+    # heuristics for amount of parallel reduction stream for DW/DB
+    N = w.shape[0]
+    GROUP_SIZE_M = 64
+    if N <= 8192: GROUP_SIZE_M = 96
+    if N <= 4096: GROUP_SIZE_M = 128
+    if N <= 1024: GROUP_SIZE_M = 256
+
+    locks = jnp.zeros(2 * GROUP_SIZE_M, dtype=jnp.int32)
+    _dw = jnp.zeros((GROUP_SIZE_M, N), dtype=x_2d.dtype)
+    _db = jnp.zeros((GROUP_SIZE_M, N), dtype=x_2d.dtype)
+
+    dw = jnp.empty(N, dtype=x_2d.dtype)
+    db = jnp.empty(N, dtype=x_2d.dtype)
+    dx = jnp.empty(dy.shape, dtype=x_2d.dtype)
+
+
+    # Compute dx
+    # specify output data shape
+
+    out_shape_dx = 
+    grid_dx = (M,)
+
+    # enqueue kernel using forward pass heuristics
+    # also compute partial sums for DW and DB
+    dx, dw, db = 
+
+    _layer_norm_bwd_dx_fused[(M, )](  #
+        dx, dy, _dw, _db, x, w, m, v, locks,  #
+        x_2d.stride(0), N,  #
+        BLOCK_SIZE_N=BLOCK_SIZE,  #
+        GROUP_SIZE_M=GROUP_SIZE_M,  #
+        num_warps=num_warps)
+
+
+
+
+
+
+    # Compute dw, db
+    # specify output data shape
+
+    out_shape_dwdb = 
+
+    grid_dwdb = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE_N']), )
+    # accumulate partial sums in separate kernel
+    _layer_norm_bwd_dwdb[grid](
+        _dw, _db, dw, db, min(GROUP_SIZE_M, M), N,  #
+        BLOCK_SIZE_M=32,  #
+        BLOCK_SIZE_N=128, num_ctas=1)
+    return dx, None, dw, db, None
 
 
 def test_layer_norm(M, N, dtype, eps=1e-5, device=DEVICE):
     # create data
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
-    weight = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
-    bias = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
-    x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device=device)
-    dy = .1 * torch.randn_like(x)
-    x.requires_grad_(True)
-    # forward pass
-    y_tri = layer_norm(x, w_shape, weight, bias, eps)
-    y_ref = torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
-    # backward pass (triton)
-    y_tri.backward(dy, retain_graph=True)
-    dx_tri, dw_tri, db_tri = [_.grad.clone() for _ in [x, weight, bias]]
-    x.grad, weight.grad, bias.grad = None, None, None
-    # backward pass (torch)
-    y_ref.backward(dy, retain_graph=True)
-    dx_ref, dw_ref, db_ref = [_.grad.clone() for _ in [x, weight, bias]]
-    # compare
-    assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
-    assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
-    assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
-    assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
 
+    key = random.PRNGKey(0)
+    key_x, key_w, key_b, key_dy = random.split(key, 4)
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['N'],
-        x_vals=[512 * i for i in range(2, 32)],
-        line_arg='provider',
-        line_vals=['triton', 'torch'] + (['apex'] if HAS_APEX else []),
-        line_names=['Triton', 'Torch'] + (['Apex'] if HAS_APEX else []),
-        styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
-        ylabel='GB/s',
-        plot_name='layer-norm-backward',
-        args={'M': 4096, 'dtype': torch.float16, 'mode': 'backward'},
-    ))
-def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device=DEVICE):
-    # create data
-    x_shape = (M, N)
-    w_shape = (x_shape[-1], )
-    weight = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
-    bias = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
-    x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device=device)
-    dy = .1 * torch.randn_like(x)
-    x.requires_grad_(True)
-    quantiles = [0.5, 0.2, 0.8]
+    x = -2.3 + 0.5 * jax.random.normal(key_x, shape=x_shape, dtype=dtype)
+    weight = jax.random.uniform(key_w, shape=w_shape, dtype=dtype)
+    bias = jax.random.uniform(key_w, shape=w_shape, dtype=dtype)
+    dy = 0.1 * jax.random.normal(key_dy, shape=x_shape, dtype=dtype)
 
-    def y_fwd():
-
-        if provider == "triton":
-            return layer_norm(x, w_shape, weight, bias, eps)  # noqa: F811, E704
-
-        if provider == "torch":
-            return torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps)  # noqa: F811, E704
-
-        if provider == "apex":
-            apex_layer_norm = (apex.normalization.FusedLayerNorm(w_shape).to(x.device).to(x.dtype))
-            return apex_layer_norm(x)  # noqa: F811, E704
+    # Less than 64KB per feature: enqueue fused kernel
+    element_size = 4 if x.dtype == jnp.float32 else 2
+    MAX_FUSED_SIZE = 65536 // element_size
+    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
+    if N > BLOCK_SIZE:
+        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
     # forward pass
-    if mode == 'forward':
-        gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
-        ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=500)
+    y, saved_tensors_for_bwd = layer_norm_fwd(x, weight, bias, eps, BLOCK_SIZE)
+    print("y:", y)
+
     # backward pass
-    if mode == 'backward':
-        y = y_fwd()
-        gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)  # noqa: F811, E704
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: y.backward(dy, retain_graph=True), quantiles=quantiles,
-                                                     grad_to_none=[x], rep=500)
-    return gbps(ms), gbps(max_ms), gbps(min_ms)
+    dx _, dw, db, _ = layer_norm_bwd(dy, saved_tensors_for_bwd, BLOCK_SIZE)
+    print("dx:", dx)
+    print("dw:", dx)
+    print("db:", dx)
 
 
-test_layer_norm(1151, 8192, torch.float16)
-bench_layer_norm.run(save_path='.', print_data=True)
+def main(unused_argv):
+    test_layer_norm(1151, 8192, tl.float16)
+
+
+if __name__ == "__main__":
+    from absl import app
+    app.run(main)
