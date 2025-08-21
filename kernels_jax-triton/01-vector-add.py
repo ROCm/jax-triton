@@ -45,7 +45,7 @@ def add(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
 def main(unused_argv):
     x_val = jnp.arange(512)
     y_val = jnp.arange(512, 1024)
-    print(add(x_val, y_val))
+    # print(add(x_val, y_val))
     print(jax.jit(add)(x_val, y_val))
 
 
