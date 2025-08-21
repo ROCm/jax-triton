@@ -4,15 +4,20 @@ from jax.experimental import pallas as pl
 
 
 def add_vectors_kernel(x_ref, y_ref, o_ref):
-    x, y = x_ref[...], y_ref[...]
-    o_ref[...] = x + y
+    i = pl.program_id(0)
+    o_ref[i] = x_ref[i] + y_ref[i]
 
 
 @jax.jit
-def add_vectors(x: jax.Array, y: jax.Array) -> jax.Array:
+def add_vectors(x: jax.Array, y: jax.Array, BLOCK_SIZE = 16) -> jax.Array:
     return pl.pallas_call(
         add_vectors_kernel,
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype)
+        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        in_specs=[
+            pl.BlockSpec(lambda i: (i * BLOCK_SIZE,), (BLOCK_SIZE,)),
+            pl.BlockSpec(lambda i: (i * BLOCK_SIZE,), (BLOCK_SIZE,))
+        ],
+        out_specs=pl.BlockSpec(lambda i: (i,), (BLOCK_SIZE,)),
     )(x, y)
 
 
