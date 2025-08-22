@@ -1,30 +1,38 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import pallas as pl
 
 
-def add_vectors_kernel(x_ref, y_ref, o_ref):
-    i = pl.program_id(0)
-    o_ref[i] = x_ref[i] + y_ref[i]
+def add_vectors_kernel(x_ref, y_ref, z_ref):
+    z_ref[...] = x_ref[...] + y_ref[...]
 
 
 @jax.jit
-def add_vectors(x: jax.Array, y: jax.Array, BLOCK_SIZE = 16) -> jax.Array:
+def add_vectors(x: jax.Array, y: jax.Array) -> jax.Array:
+    assert x.shape == y.shape
+    BLOCK_SIZE = 2
+    out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+    grid = ((x.size + BLOCK_SIZE - 1) // BLOCK_SIZE,)
     return pl.pallas_call(
         add_vectors_kernel,
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        out_shape=out_shape,
+        grid=grid,
         in_specs=[
-            pl.BlockSpec(lambda i: (i * BLOCK_SIZE,), (BLOCK_SIZE,)),
-            pl.BlockSpec(lambda i: (i * BLOCK_SIZE,), (BLOCK_SIZE,))
+            pl.BlockSpec((BLOCK_SIZE,), lambda i: (i * BLOCK_SIZE,)),
+            pl.BlockSpec((BLOCK_SIZE,), lambda i: (i * BLOCK_SIZE,))
         ],
-        out_specs=pl.BlockSpec(lambda i: (i,), (BLOCK_SIZE,)),
+        out_specs=pl.BlockSpec((BLOCK_SIZE,), lambda i: (i * BLOCK_SIZE,)),
     )(x, y)
 
 
 def main(unused_argv):
-    x_val = jnp.arange(512)
-    y_val = jnp.arange(512, 1024)
-    print(add_vectors(x_val, y_val))
+    x = jnp.arange(8)
+    y = jnp.arange(8, 16)
+    z = add_vectors(x, y)
+
+    expected = x + y
+    np.testing.assert_allclose(z, expected)
 
 
 if __name__ == "__main__":
