@@ -11,28 +11,24 @@ def add_vectors_kernel(x_ref, y_ref, z_ref):
 @jax.jit
 def add_vectors(x: jax.Array, y: jax.Array) -> jax.Array:
     assert x.shape == y.shape
-    BLOCK_SIZE = 2
+    BLOCK_SIZE = 16
     out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
-    grid = ((x.size + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+    grid = (x.size // BLOCK_SIZE,)
     return pl.pallas_call(
         add_vectors_kernel,
         out_shape=out_shape,
         grid=grid,
-        in_specs=[
-            pl.BlockSpec((BLOCK_SIZE,), lambda i: (i * BLOCK_SIZE,)),
-            pl.BlockSpec((BLOCK_SIZE,), lambda i: (i * BLOCK_SIZE,))
-        ],
-        out_specs=pl.BlockSpec((BLOCK_SIZE,), lambda i: (i * BLOCK_SIZE,)),
     )(x, y)
 
 
 def main(unused_argv):
-    x = jnp.arange(8)
-    y = jnp.arange(8, 16)
+    x = jnp.arange(512)
+    y = jnp.arange(512, 1024)
     z = add_vectors(x, y)
 
     expected = x + y
     np.testing.assert_allclose(z, expected)
+    print("Test passed!")
 
 
 if __name__ == "__main__":
