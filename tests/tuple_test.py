@@ -219,6 +219,8 @@ class TupleTest(parameterized.TestCase):
     tx = Tensor(x, x.shape, jax_strides(x))
     ty = Tensor(y, y.shape, jax_strides(y))
     y = _namedtuple_kernel[(1,)](function, tx, ty, 64, 64, input_output_aliases="Y")
+    # while aliased argument `ty` is a tuple, it has only a single internal array, so
+    # it gets unwrapped from the tuple.
     np.testing.assert_allclose(y, x[:16, :16] * a)
 
   def test_passing_nested_tuple_with_constexpr(self):

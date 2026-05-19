@@ -25,13 +25,13 @@ import itertools
 import os
 import pprint
 import tempfile
-import types
 from typing import Any, Protocol, Self, Union
 import zlib
 
 import jax
 from jax import tree_util
-from jax._src import core, util
+from jax._src import core
+from jax._src import util
 from jax._src.lib import gpu_triton as triton_kernel_call_lib
 import jax.extend as jex
 from jax.interpreters import ad
@@ -105,6 +105,16 @@ _JAX_TO_TRITON_TYPE_MAP = {
 }
 
 
+def normalize_grid(grid: GridOrLambda, metaparams) -> tuple[int, int, int]:
+  if callable(grid):
+    grid = grid(metaparams)
+  if isinstance(grid, int):
+    grid = (grid,)
+  elif len(grid) > 3:
+    raise ValueError("`grid` should have three or fewer dimensions.")
+  return tuple(grid) + (1,) * (3 - len(grid))
+
+
 # Type handling is slightly messy here. Triton uses exact dtypes for arrays, but for
 # scalars (whether constexpr or runtime) it accepts native Python objects only. The
 # actual type of a kernel parameter is determined solely from the parameter type
@@ -161,16 +171,6 @@ def to_python_type(arg: Any) -> Any:
   # else return as-is and let it possibly, but not necessarily, fail (constexprs and
   # strings pass through, and the rest isn't expected here, so saving cycles on that)
   return arg
-
-
-def normalize_grid(grid: GridOrLambda, metaparams) -> tuple[int, int, int]:
-  if callable(grid):
-    grid = grid(metaparams)
-  if isinstance(grid, int):
-    grid = (grid,)
-  elif len(grid) > 3:
-    raise ValueError("`grid` should have three or fewer dimensions.")
-  return tuple(grid) + (1,) * (3 - len(grid))
 
 
 def avals_to_layouts(avals):
@@ -553,18 +553,19 @@ class JTJITFunction:
     specialization: list[tuple[str, Any]],
     kwargs: dict[str, Any],
   ) -> tuple[str, triton_kernel_call_lib.TritonKernel | None]:
-    if "_cOmpute_capability" in kwargs:  # capitalization is intended!
-      raise ValueError("'_cOmpute_capability' key is reserved in the options/kwargs!")
-    kwargs["_cOmpute_capability"] = compute_capability
+    if "_compute_capability" in kwargs:
+      raise ValueError("'_compute_capability' key is reserved in the options/kwargs!")
+    kwargs["_compute_capability"] = compute_capability
 
     if not hasattr(self.fn, "_jT_kernel_cache_key"):
       self.fn._jT_kernel_cache_key = {}
 
-    # two-step key resolution is important for supporting callables
+    # `triton_runtime_jit.compute_cache_key()` walks through kernel dependencies and
+    # produces a hash with absolutely all kernel compilation dependencies accounted for.
     key = triton_runtime_jit.compute_cache_key(
       self.fn._jT_kernel_cache_key, specialization, kwargs
     )
-    del kwargs["_cOmpute_capability"]
+    del kwargs["_compute_capability"]
 
     if not hasattr(self.fn, "_jT_kernel_cache"):
       self.fn._jT_kernel_cache = {}
@@ -587,11 +588,7 @@ class JTJITFunction:
   @property
   def asm(self) -> dict[str, dict] | None:
     """Returns a dictionary of assembly files for the kernel, if they were saved during
-    compilation.
-    Not the ideal way to expose this info, but likely no one needs it except our tests.
-    If better access is needed, a getter could be added to fetch at least ttir from the
-    corresponding triton_kernel_call_lib.TritonKernel object instead.
-    """
+    compilation."""
     return self.fn._jT_asm if hasattr(self.fn, "_jT_asm") else None
 
   def clean_asm(self):
@@ -648,25 +645,27 @@ class JTJITFunction:
   ) -> Callable[
     [Any, ..., Any], tuple[dict[str, Any], list[tuple[str, Any]], dict[str, Any]]
   ]:
-    # This important part needs to be fully understood.
-    # create_function_from_signature() is a clever optimization in Triton that generates
-    # a so-called binder function once per kernel, which simultaneously and efficiently:
-    # 1. assigns default values to all unspecified kernel arguments,
-    # 2. assembles a complete dict of parameter_name->value mapping for all arguments,
-    # 3. runs the correct specialization pipeline for all arguments, respecting all
-    # user annotations,
-    # 4. finds key-value elements of kwargs that don't match any kernel signature param.
-    # The dynamically generated binder function exists purely for performance — it
-    # avoids the overhead of a branching algorithm for building the specialization and
-    # applying defaults on every kernel launch, while still computing the specialization
-    # tuples from the actual runtime argument values.
     if not hasattr(self.fn, "_jT_binder"):
-      # In the upstream, a binder is per-device. Since JAX doesn't support mixed
-      # execution yet, we can safely ignore it.
-      self.fn._jT_binder = triton_runtime_jit.create_function_from_signature(
-        self.fn.signature, self.fn.params, backend
+      self.fn._jT_binder = {}
+
+    # In the upstream, a binder is per-`torch._C._cuda_getDevice()`. Here the closest
+    # equivalent for this should be backend.hash() which is generally a GPU arch string.
+    backend_hash = backend.hash()
+    binder = self.fn._jT_binder.get(backend_hash, None)
+    if binder is None:
+      # create_function_from_signature() is a clever optimization in Triton that makes
+      # a so-called binder function for the kernel, which simultaneously:
+      # 1. assigns default values to all unspecified kernel arguments,
+      # 2. assembles a complete dict of parameter_name->value mapping for all arguments,
+      # 3. runs the correct specialization pipeline for all arguments, respecting all
+      #   user annotations,
+      # 4. finds key-value pairs in kwargs that don't match any kernel signature param.
+      self.fn._jT_binder[backend_hash] = binder = (
+        triton_runtime_jit.create_function_from_signature(
+          self.fn.signature, self.fn.params, backend
+        )
       )
-    return self.fn._jT_binder
+    return binder
 
   def get_or_create_triton_kernel(
     self,
@@ -698,24 +697,11 @@ class JTJITFunction:
     # named_args is a complete dict of kernel param names -> actual values.
     # other_kwargs is kwargs with keys matching kernel parameters removed.
     # specialization is a list[tuple[str, Any]], one entry per kernel parameter, that
-    # captures two things about each argument at call time:
-    #   1. Element 0 — the type string: e.g. "i32", "i64", "*fp16", "*ki32"
-    #     (pointer to const), "u1", "fp32", "constexpr", "tensordesc<...>".
-    #   2. Element 1 — the specialization value (the "key"): an attribute that may
-    #     trigger a separately compiled kernel variant. Currently possible values are:
-    #     - None — no runtime specialization (used for bools, floats, do_not_specialize
-    #         params)
-    #     - "D" — value/pointer is divisible by 16 (alignment hint)
-    #     - "" (empty string) — value/pointer is NOT divisible by 16
-    #     - The actual Python value itself — for constexpr parameters and int(1)
-    #     - A cache_key — for JITCallable (nested kernel) arguments. In that case the
-    #         specialization value is a hash string (hopefully lowercase).
-    #         Likely by a coincidence this doesn't hurt `attrs` building later.
-    # The specialization values are determined at call time by native_specialize_impl in
-    # C++ (triton/python/src/specialize.cc).
-    # Specialization serves 3 goals: (1) affect the kernel caching key, (2) discover
-    # additional vars to be turned into constexprs by the compiler, (3) source for the
-    # `attrs` spec.
+    # captures two things about each argument at call time: data type reflection, and
+    # specialization value (an attribute that may trigger a separately compiled kernel
+    # variant). Specialization serves 3 goals: (1) it affects the kernel caching key,
+    # (2) discover additional vars to be turned into constexprs by the compiler,
+    # (3) is a source for the `attrs` spec.
 
     attrs, non_constexprs, sigvals = self._make_attrs_nonconstexprs_sigvals(
       backend, specialization, named_args
@@ -742,7 +728,7 @@ class JTJITFunction:
       signature, constexprs = self._make_signature_constexprs(named_args, sigvals)
 
       backend_fields = _BACKEND_OPTIONS_FIELD_NAMES[gpu_target.backend]
-      unrecognized = set(kwargs.keys()) - set(named_args.keys()) - backend_fields
+      unrecognized = kwargs.keys() - named_args.keys() - backend_fields
       if len(unrecognized) > 0:
         raise ValueError(
           f"Unknown backend options: '{ {k: kwargs[k] for k in unrecognized} }' "
@@ -890,25 +876,24 @@ def make_kernel_params(
   configs: list[triton.Config],
 ) -> list[dict[str, Any]]:
   """Make kernel call parameters for each config."""
-  zeroed_outputs_callable = callable(zeroed_outputs)
-
   kernel_params = []
   for config in configs:
-    config_metaparams = {**kwargs, **config.kwargs}
     # propagating backend-related config params
-    config_metaparams["num_warps"] = config.num_warps
-    config_metaparams["num_stages"] = config.num_stages
-    config_metaparams["num_ctas"] = config.num_ctas
+    config_metaparams = {
+      **kwargs,
+      **config.kwargs,
+      "num_warps": config.num_warps,
+      "num_stages": config.num_stages,
+      "num_ctas": config.num_ctas,
+      "maxnreg": config.maxnreg,
+    }
     if config.maxnreg is None:
-      if "maxnreg" in config_metaparams:
-        del config_metaparams["maxnreg"]
-    else:
-      config_metaparams["maxnreg"] = config.maxnreg
+      del config_metaparams["maxnreg"]
 
     config_grid = normalize_grid(grid, config_metaparams)
 
     config_zeroed_outputs = (
-      zeroed_outputs(config_metaparams) if zeroed_outputs_callable else zeroed_outputs
+      zeroed_outputs(config_metaparams) if callable(zeroed_outputs) else zeroed_outputs
     )
 
     # zeroed_params_with_sizes is a dict raw_array_idx -> aval_size_bytes
@@ -1136,13 +1121,13 @@ def triton_kernel_call_lowering(
 
   if len(kernel_calls) > 1:
     input_output_aliases_with_sizes = tuple(
-      (input_idx, output_idx, aval_size_bytes(ctx.avals_in[input_idx]))
-      for input_idx, output_idx in operand_output_aliases.items()
+        (input_idx, output_idx, aval_size_bytes(ctx.avals_in[input_idx]))
+        for input_idx, output_idx in operand_output_aliases.items()
     )
     kernel_call = triton_kernel_call_lib.TritonAutotunedKernelCall(
-      f"{kernel_call_name} ({fn.fn.__name__}) {nonabstracted}",
-      [(call, str(config)) for call, config in zip(kernel_calls, configs)],
-      input_output_aliases_with_sizes,
+        f"{kernel_call_name} ({fn.fn.__name__}) {nonabstracted}",
+        [(call, str(config)) for call, config in zip(kernel_calls, configs)],
+        input_output_aliases_with_sizes,
     )
   else:
     kernel_call = kernel_calls[0]
@@ -1157,17 +1142,17 @@ def triton_kernel_call_lowering(
   # TODO(phawkins): remove forward_compat after 2026-05-04
   if jax.__version_info__ < (0, 10, 1) or ctx.is_forward_compat():
     rule = jax.ffi.ffi_lowering(
-      "triton_kernel_call",
-      api_version=2,
-      backend_config=zlib.compress(call_proto),
-      operand_output_aliases=operand_output_aliases,
+        "triton_kernel_call",
+        api_version=2,
+        backend_config=zlib.compress(call_proto),
+        operand_output_aliases=operand_output_aliases,
     )
     return rule(ctx, *abstract_args)
   else:
     rule = jax.ffi.ffi_lowering(
-      "triton_kernel_call_ffi",
-      api_version=4,
-      operand_output_aliases=operand_output_aliases,
+        "triton_kernel_call_ffi",
+        api_version=4,
+        operand_output_aliases=operand_output_aliases,
     )
     return rule(ctx, *abstract_args, opaque=zlib.compress(call_proto))
 
@@ -1310,8 +1295,7 @@ def _in_spec_to_ShapeDtypeStruct(
       kwargs[idx2name[param_idx] if orig_name is None else orig_name], path[1:]
     )
 
-  def _unpack_arg(_, elm: Any):
-    nonlocal shapes, aliases
+  def _unpack_arg(elm: Any, shapes:list[jax.ShapeDtypeStruct]):
     if isinstance(elm, jax.Array):
       shape = jax.ShapeDtypeStruct(elm.shape, elm.dtype)
       aid = id(elm)
@@ -1319,19 +1303,24 @@ def _in_spec_to_ShapeDtypeStruct(
         raise ValueError(f"Array {elm} found under path {path} can't be aliased twice")
       aliases[aid] = id(shape)
       shapes.append(shape)
-    elif not isinstance(elm, tuple):
-      raise ValueError(
-        f"Aliased element {elm} under path {path} is not a jax.Array or a tuple of them"
-      )
+    else:
+      if isinstance(elm, tuple):
+        new_shapes = []
+        for e in elm:
+          _unpack_arg(e, new_shapes)
+        if new_shapes:
+          shapes.append(tuple(new_shapes))
+      # else: just ignore any other arguments
 
   if isinstance(arg, jax.Array):
-    _unpack_arg(None, arg)
+    _unpack_arg(arg, shapes)
   elif not isinstance(arg, tuple):
     raise ValueError(
       f"Aliased element {arg} at path {path} is not a jax.Array or a tuple of them"
     )
   else:
-    functools.reduce(_unpack_arg, arg, None)
+    for elm in arg:
+      _unpack_arg(elm, shapes)
 
 
 def make_aliased_shapes(
@@ -1369,7 +1358,6 @@ def make_aliased_shapes(
       assert len(inner_shapes) == len(elm)
       shapes.append(tuple(inner_shapes))
     else:
-      nonlocal aliases
       _in_spec_to_ShapeDtypeStruct(
         elm, args, kwargs, name2idx, idx2name, aliases, inner_shapes
       )
@@ -1378,7 +1366,6 @@ def make_aliased_shapes(
 
   aliased_shapes = []
   tuple(_make_aliased(e, aliased_shapes) for e in in_spec)
-  # aliased_shapes = _make_aliased(in_spec) if in_spec else []
 
   # TODO: perhaps remove the whole `if is_dict:` below to spare cycles?
   # if it's a dict, validate that out_shapes match aliased_shapes
@@ -1470,7 +1457,7 @@ def canonicalize_out_shape(
       out_values = tuple(out_shape.values())  # must materialize
     else:
       # TODO: remove the check to speedup things/check only lengths, or add cache?
-      if frozenset(out_names) != frozenset(out_shape.keys()):
+      if frozenset(out_names) != out_shape.keys():
         raise ValueError("out_names and out_shape must have the same keys")
       out_values = tuple(out_shape[name] for name in out_names)  # reorder
 
@@ -1492,7 +1479,7 @@ def canonicalize_out_shape(
       out_names = tuple(arg_names[i + len(args)] for i in range(len(out_values)))
     if len(out_names) != len(out_values):  # this checks only top level specs
       raise ValueError("out_shape specification mismatches out_names")
-  # no use of out_shape below this line
+  del out_shape  # safer to hide from scope as it's no longer needed
 
   def _to_ShapeDtypeStruct(a: Any) -> jax.ShapeDtypeStruct:
     return jax.ShapeDtypeStruct(a.shape, a.dtype)
@@ -1527,16 +1514,13 @@ def _canonicalize_out_spec_element(
   elm: InOutSpec,
   name2idx: dict[str, int],
 ) -> CanonicalKernelArgPath:
-  orig_name = None
   if isinstance(elm, int):
     path = (elm,)
   elif isinstance(elm, str):
-    orig_name = elm
     path = (name2idx[elm],)  # user is responsible for correct indexing
   elif isinstance(elm, tuple):
     prim_idx = elm[0]
     if isinstance(prim_idx, str):
-      orig_name = prim_idx
       path = (name2idx[prim_idx], *elm[1:])
     else:
       if not isinstance(prim_idx, int):
@@ -1550,29 +1534,29 @@ def _canonicalize_out_spec_element(
 
 
 def triton_call(
-  *args: jax.Array | bool | int | float | np.float32,
-  kernel: (
-    triton.JITFunction
-    | gl_runtime.GluonJITFunction
-    | triton.runtime.Heuristics
-    | triton.runtime.Autotuner
-  ),
-  grid: GridOrLambda,
-  out_shape: ShapeDtype | Sequence[ShapeDtype] | dict[str, ShapeDtype] = (),
-  out_names: None | str | tuple[str, ...] = None,
-  name: str = "",
-  num_warps: int | None = None,
-  num_stages: int | None = None,
-  num_ctas: int = 1,  # TODO(giorgioa): Add support for dimensions tuple.
-  compute_capability: int | None = None,
-  enable_fp_fusion: bool = True,
-  input_output_aliases: dict[int, int] | None = None,
-  zeroed_outputs: (
-    Sequence[InOutSpec] | Callable[[dict[str, Any]], Sequence[InOutSpec]]
-  ) = (),
-  debug: bool = False,
-  serialized_metadata: bytes = b"",
-  **kwargs: Any,
+    *args: jax.Array | bool | int | float | np.float32,
+    kernel: (
+        triton.JITFunction
+        | gl_runtime.GluonJITFunction
+        | triton.runtime.Heuristics
+        | triton.runtime.Autotuner
+    ),
+    grid: GridOrLambda,
+    out_shape: ShapeDtype | Sequence[ShapeDtype] | dict[str, ShapeDtype] = (),
+    out_names: None | str | tuple[str, ...] = None,
+    name: str = "",
+    num_warps: int | None = None,
+    num_stages: int | None = None,
+    num_ctas: int = 1,  # TODO(giorgioa): Add support for dimensions tuple.
+    compute_capability: int | None = None,
+    enable_fp_fusion: bool = True,
+    input_output_aliases: dict[int, int] | None = None,
+    zeroed_outputs: (
+        Sequence[InOutSpec] | Callable[[dict[str, Any]], Sequence[InOutSpec]]
+    ) = (),
+    debug: bool = False,
+    serialized_metadata: bytes = b"",
+    **kwargs: Any,
 ) -> Any:
   """Calls a Triton kernel with `jax.Array` arguments.
 
@@ -1624,8 +1608,6 @@ def triton_call(
   print(jax.jit(add)(x_val, y_val))
   ```
 
-  You can find many more usage examples in the tests directory.
-
   Kernel output and aliasing specification introduce necessary complexity on top of
   Triton to interoperate with JAX. To address this, a concept of "Kernel's signature
   coordinate system" is used — it is a hashable way to address an individual array at
@@ -1642,7 +1624,7 @@ def triton_call(
       kernel, and expects the corresponding argument to be a tuple whose 0th element is
       another tuple, and whose 1st element is an array or a tuple of arrays/tuples.
 
-  `triton_call()` parameters:
+  Args:
     *args: Positional inputs for the Triton kernel. In the kernel signature, purely
       output parameters should go after the last input parameter to be passed as
       a positional argument to `triton_call()`.
@@ -1713,9 +1695,9 @@ def triton_call(
       When `grid` is a function, it is passed `kwargs` and should return a tuple of up
       to 3 integers.
 
-    input_output_aliases: Tells the JAX/XLA backend which input arguments not only
-      supply input data to the kernel, but also serve as output buffers (requiring the
-      backend to arrange not only `host->device` data copying before kernel launch, but
+    input_output_aliases: Tells XLA that it shouldn't allocate fresh output buffers for
+      these arguments, but instead alias the input buffers (requiring the backend to
+      arrange not only `host->device` data copying before kernel launch, but
       also `device->host` data copying after kernel execution). Can take two forms:
 
       (1 — deprecated): A dictionary mapping an input array coordinate in the kernel's
@@ -1758,6 +1740,12 @@ def triton_call(
       buffer to be returned as an output (for example, for sparse updates), you should
       designate a purely output argument for it with a proper `out_shape` specification
       and list its coordinate in `zeroed_outputs`.
+
+      Attention: You as a user is responsible for ensuring that all arrays listed in
+      input_output_aliases are used strictly once anywhere in *args, **kwargs (i.e.
+      for each array A in (*args, **kwargs) from input_output_aliases, id(A) is not
+      equal to ANY other id(B) of an array B from (*args, **kwargs)). Failure to adhere
+      to that rule might lead to an undefined behavior.
 
     zeroed_outputs: A sequence of kernel signature coordinates of output arguments, or
       a function taking a dict of metaparameters and returning a sequence of such
@@ -1842,6 +1830,15 @@ def triton_call(
   # The structure of `aliased_shapes` helps return aliased arrays in the correct form;
   # flattened values are the shapes passed to .bind(). `aliases` helps generate the
   # properly array-only indexed `operand_output_aliases` needed for the FFI interface.
+  # We match aliased (from XLA's point of view) arrays using Python's id() function.
+  # From the point of view of constructing `operand_output_aliases`, it's a benign
+  # situation when the same input-only array is used several times as a kernel parameter
+  # (pure inputs have no role in `operand_output_aliases` and when their id()'s collapse
+  # to a single value, it's still ignored), however, we require a user to never use
+  # an `input_output_aliases`-ed array twice or more as a kernel parameter, since this
+  # is already a UB from XLA's and compiler's point of view (when two arguments refer
+  # to the same memory location, in general case, write to which argument takes
+  # precedence?).
   abs_args_kwargs, array_id2idx, args_kwargs_meta = serialize_args_kwargs(
     jtfu, args, kwargs
   )
@@ -1857,27 +1854,26 @@ def triton_call(
     array_id2idx[arr_id]: aliased_shape_id2idx[shp_id]
     for arr_id, shp_id in aliases.items()
   }
-  num_aliased_outputs = len(aliased_shapes_flat)
 
-  if num_pure_outputs + num_aliased_outputs == 0:
+  if num_pure_outputs + aliased_tree.num_leaves == 0:
     raise ValueError(
       "No outputs specified for the kernel, DCE will eliminate the call entirely"
     )
 
   out_flat = triton_kernel_call_p.bind(
-    *abs_args_kwargs,
-    fn=kernel,
-    kernel_call_name=name,
-    # out_shapes must be a flat sequence of shapes of ALL arrays to be returned:
-    # purely output + input-output (aliased) arrays.
-    out_shapes=(*pure_out_shapes_flat, *aliased_shapes_flat),
-    grid=grid,
-    compute_capability=compute_capability,
-    operand_output_aliases=tuple(operand_output_aliases.items()),
-    zeroed_outputs=zeroed_outputs,
-    serialized_metadata=serialized_metadata,
-    args_kwargs=args_kwargs_meta,
-    out_info=(num_pure_outputs, pure_out_tree),
+      *abs_args_kwargs,
+      fn=kernel,
+      kernel_call_name=name,
+      # out_shapes must be a flat sequence of shapes of ALL arrays to be returned:
+      # purely output + input-output (aliased) arrays.
+      out_shapes=(*pure_out_shapes_flat, *aliased_shapes_flat),
+      grid=grid,
+      compute_capability=compute_capability,
+      operand_output_aliases=tuple(operand_output_aliases.items()),
+      zeroed_outputs=zeroed_outputs,
+      serialized_metadata=serialized_metadata,
+      args_kwargs=args_kwargs_meta,
+      out_info=(num_pure_outputs, pure_out_tree),
   )
 
   pure_outs = (
@@ -1887,7 +1883,7 @@ def triton_call(
   )
   aliased_outs = (
     tree_util.tree_unflatten(aliased_tree, out_flat[num_pure_outputs:])
-    if num_aliased_outputs > 0
+    if aliased_tree.num_leaves > 0
     else ()
   )
   ret = tuple(pure_outs.values()) + aliased_outs

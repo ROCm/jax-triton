@@ -474,22 +474,47 @@ class TritonKernelCallTest(parameterized.TestCase):
       )
 
     rets = [None] * 5
+    k1 = jttl.JTJITFunction(kernel)
+    self.assertEqual(k1.compiled_kernels_cache_size, 0)
     rets[0] = launch_kernel(func1, tuple())
     rets[1] = launch_kernel(func2, tuple())
     rets[2] = launch_kernel(func3, (3,))
     rets[3] = launch_kernel(func4, (3, 4))
     rets[4] = launch_kernel(func1, tuple())
-    self.assertEqual(jttl.JTJITFunction(kernel).compiled_kernels_cache_size, 4)
+    self.assertEqual(k1.compiled_kernels_cache_size, 4)
     np.testing.assert_array_equal(rets, [1, 2, 3, 7, 1])
 
     rets = [None] * 5
+    k2 = jttl.JTJITFunction(kernel2)
+    self.assertEqual(k2.compiled_kernels_cache_size, 0)
     rets[0] = launch_kernel(func1, tuple(), kernel=kernel2)
     rets[1] = launch_kernel(func2, tuple(), kernel=kernel2)
     rets[2] = launch_kernel(func3, (3,), kernel=kernel2)
     rets[3] = launch_kernel(func4, (3, 4), kernel=kernel2)
     rets[4] = launch_kernel(func1, tuple(), kernel=kernel2)
-    self.assertEqual(jttl.JTJITFunction(kernel2).compiled_kernels_cache_size, 4)
+    self.assertEqual(k2.compiled_kernels_cache_size, 4)
     np.testing.assert_array_equal(rets, [1, 2, 3, 7, 1])
+
+  def test_explicit_constexpr_argument(self):
+    @triton.jit
+    def add_scalar_kernel(x_ptr, y, output_ptr):
+      tl.store(output_ptr, tl.load(x_ptr) + y)
+
+    jt_cache_size = lambda: jttl.JTJITFunction(add_scalar_kernel).compiled_kernels_cache_size
+    self.assertEqual(jt_cache_size(), 0)
+
+    x = jnp.array([1.0])
+    call = lambda y: jt.triton_call(x, y, kernel=add_scalar_kernel, out_shape=x, grid=1)
+
+    np.testing.assert_allclose(call(4.0), x + 4)
+    self.assertEqual(jt_cache_size(), 1)
+    np.testing.assert_allclose(call(4.0), x + 4)
+    self.assertEqual(jt_cache_size(), 1)
+
+    np.testing.assert_allclose(call(tl.constexpr(4.0)), x + 4)
+    self.assertEqual(jt_cache_size(), 2)
+    np.testing.assert_allclose(call(tl.constexpr(4.0)), x + 4)
+    self.assertEqual(jt_cache_size(), 2)
 
   def test_jit_function_arg(self):
     @triton.jit
@@ -973,8 +998,7 @@ class TritonKernelCallTest(parameterized.TestCase):
       return z, libdevice.floor(2 * y)
 
     @triton.jit
-    def floor_of_func(values, SIZE: tl.constexpr, FUNC_NAME: tl.constexpr):
-      off = tl.arange(0, SIZE)
+    def floor_of_func(values, FUNC_NAME: tl.constexpr):
       return libdevice.floor(getattr(libdevice, FUNC_NAME)(values))
 
     @triton.jit
@@ -989,7 +1013,7 @@ class TritonKernelCallTest(parameterized.TestCase):
     def kernel(capture, out_ptr, SIZE: tl.constexpr, FUNC_NAME: tl.constexpr):
       off = tl.arange(0, SIZE)
       t1, t2 = capture.fn(*capture.captured, SIZE=SIZE)
-      t3 = floor_of_func(t1, SIZE=SIZE, FUNC_NAME=FUNC_NAME)
+      t3 = floor_of_func(t1, FUNC_NAME=FUNC_NAME)
       t4 = t2 * t3
       result = aggregate((t4, t4 * t4)).to(tl.int32)
       tl.store(out_ptr + off, result)

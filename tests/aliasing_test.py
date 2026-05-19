@@ -397,6 +397,24 @@ class TritonCallAliasingTest(parameterized.TestCase):
     np.testing.assert_array_equal(out[1], jnp.array([110], dtype=jnp.int32))
     self.assertEqual(out[1].dtype, jnp.int32)
 
+  def test_nested_aliasing(self):
+    @triton.jit
+    def _k_nested(Ptrs, BLOCK: tl.constexpr):
+      offs = tl.arange(0, BLOCK)
+      tl.store(Ptrs[0] + offs, tl.load(Ptrs[0] + offs) + 1)
+      tl.store(Ptrs[1][0] + offs, tl.load(Ptrs[1][0] + offs) + 2)
+      tl.store(Ptrs[1][1] + offs, tl.load(Ptrs[1][1] + offs) + 3)
+
+    a = jnp.array([1.0], dtype=jnp.float32)
+    b = jnp.array([2.0], dtype=jnp.float32)
+    c = jnp.array([3.0], dtype=jnp.float32)
+    out = jt.triton_call((a, (b, c)), 1, input_output_aliases="Ptrs", kernel=_k_nested, grid=(1,))
+    assert isinstance(out, tuple) and len(out) == 2
+    np.testing.assert_array_equal(out[0], jnp.array([2.0], dtype=jnp.float32))
+    assert isinstance(out[1], tuple) and len(out[1]) == 2
+    np.testing.assert_array_equal(out[1][0], jnp.array([4.0], dtype=jnp.float32))
+    np.testing.assert_array_equal(out[1][1], jnp.array([6.0], dtype=jnp.float32))
+
 
 if __name__ == "__main__":
   os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.5"
