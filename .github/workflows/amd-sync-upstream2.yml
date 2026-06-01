@@ -1,0 +1,446 @@
+# =============================================================================
+# Automated Upstream Sync (v2)
+# =============================================================================
+#
+# PURPOSE
+#   Daily, propose the latest `upstream/main` (jax-ml/jax-triton) changes onto
+#   `amd-main` via a pull request, but only when there is something worth syncing.
+#   We integrate the `upstream/main` tip DIRECTLY; does NOT depend on local mirror
+#   branch (no reliance on `main`).
+#
+#   `amd-main` carries our not-yet-upstreamed changes AND owns its own,
+#   independent `.github/` directory. Upstream `.github/` changes are NEVER
+#   synced into `amd-main`.
+#
+# HIGH-LEVEL FLOW
+#   1. Fetch `upstream/main` and record its tip.
+#   2. Evaluate what merging `upstream/main` into `amd-main` would produce,
+#      IGNORING `.github/`.
+#   3. Open a PR into `amd-main` if and only if that produces a non-empty
+#      diff outside `.github/` (a merge conflict always counts as "non-empty").
+#      Conflicts are left for human reviewers; the automation never resolves
+#      them.
+#
+# KEY DESIGN DECISIONS (and why)
+#   * .github protection is baked into the PR branch, NOT delegated to a
+#     `.gitattributes` `merge=ours` driver. GitHub's server-side merge (the
+#     "Merge" button) does NOT execute custom git merge drivers, so the
+#     `merge.ours.driver` approach cannot protect `.github` when a reviewer
+#     merges the PR on github.com. Instead we make `.github` on the PR branch
+#     byte-identical to `amd-main`, so any merge of the branch is a guaranteed
+#     no-op for `.github`.
+#     `.gitattributes` `merge=ours` is set only as an additional level of protection
+#     for local merges, should they happen.
+#
+#   * Hybrid branch construction:
+#       - No conflicts  -> the PR head is `amd-main` (or BASE_TIP) + a finished
+#         merge commit (with `.github` kept as amd-main's). The PR diff is clean:
+#         only the upstream, non-`.github` changes.
+#       - Conflicts     -> the PR head is `upstream/main` + one commit pinning
+#         `.github` to amd-main's version. GitHub then surfaces the real
+#         conflicts in its native UI and BLOCKS merging until a human resolves
+#         them. We never commit conflict markers.
+#
+#   * Stacked PRs. If a sync PR is already open, we do NOT touch it. Instead we
+#     find the tip of the open sync-PR chain by WALKING base->head links starting
+#     from `amd-main`: repeatedly pick an open sync PR whose base is the current
+#     branch and advance to its head. We branch off that tip and open a new PR
+#     whose base is the tip's branch. Each sync PR therefore shows a clean,
+#     incremental diff containing only that sync's changes, and the description
+#     records that the previous PR must be merged first. Stacked PRs are merged
+#     bottom-up (oldest first); GitHub auto-retargets the next PR's base once the
+#     one below it is merged.
+#
+#     Walking the chain (rather than "newest open PR") makes this robust to:
+#       - a middle PR being CLOSED without merging: the gap stops the walk at the
+#         last still-open link, so we stack there and the next merge re-proposes
+#         whatever upstream work is not yet in that base;
+#       - a PR being MODIFIED/retargeted before merging: we always read the live
+#         branch tips and live base links, so manual edits are picked up.
+#
+#   * Branch cleanup. A final step deletes sync branches that are no longer
+#     referenced by ANY open PR (neither as head nor as base), so it never breaks
+#     a still-open (even orphaned) PR.
+#
+# MERGE STRATEGY FOR THE PR  ***IMPORTANT***
+#   Merge the generated PR strictly using "Create a merge commit".
+#   Do NOT "Squash and merge" and do NOT "Rebase and merge".
+#
+#   A real merge commit records that the base contains `upstream/main`'s
+#   commits as ancestors. The next run then sees those upstream commits as
+#   already-integrated (via `git merge-base --is-ancestor`) and only brings in
+#   genuinely new work. When PRs are stacked, merge them bottom-up (oldest
+#   first), each with "Create a merge commit".
+#
+#   Recovery from a wrong (squash/rebase) merge: ancestry self-heals as soon as
+#   any later sync PR is merged correctly - a merge commit re-records the
+#   upstream tip as an ancestor of amd-main, so `--is-ancestor` and the
+#   merge-base computation work again. To fix it immediately, a maintainer can
+#   record-only re-link (no file changes) via `git merge -s ours <upstream-tip>`
+#   - safe only when the already-merged content matches that tip.
+#
+#   Squash and rebase do NOT add the PR's commits to the base branch. They
+#   synthesize brand-new commit(s) with new SHAs and drop the originals'
+#   identity, so afterwards the upstream commits the PR carried are NOT
+#   ancestors of amd-main. That severs the ancestry the detection relies on:
+#   the merge base stays pinned just before the mis-merged sync, so later runs
+#   recompute against that stale base and re-propose already-integrated changes
+#   (regenerating avoidable conflicts) until a correctly merged sync re-links it.
+#
+# REQUIRED SECRET  ***IMPORTANT***
+#   `SYNC_TOKEN`: a token with `repo` + `workflow` scopes (a fine-grained PAT
+#   with Contents:write + Workflows:write + Pull requests:write, a classic PAT
+#   with `repo` + `workflow`, or a GitHub App installation token).
+#
+#   The default `GITHUB_TOKEN` is INSUFFICIENT: syncing `upstream/main`
+#   inevitably modifies files under `.github/workflows/`, and `GITHUB_TOKEN`
+#   is forbidden from pushing commits that touch `.github/workflows/`. Such a
+#   push is rejected with "refusing to allow ... to create or update workflow".
+#
+# ASSUMPTIONS (verify!)
+#   * `amd-main` is the default branch (so this scheduled workflow arms).
+#   * `SYNC_TOKEN` can push the per-sync branches under `SYNC_PREFIX` and open
+#     PRs (only those automation branches are pushed; nothing pushes to `main`).
+#   * PRs opened with a PAT do trigger other workflows; PRs opened with the
+#     default GITHUB_TOKEN do not (another reason to use SYNC_TOKEN).
+# =============================================================================
+
+name: Automated Upstream Sync (v2)
+
+on:
+  schedule:
+    # Daily (UTC). Note: GitHub may delay scheduled runs under load,
+    # and auto-disables schedules after ~60 days of repository inactivity.
+    - cron: '34 8 * * *'
+  workflow_dispatch:
+
+# Never run two syncs at once; let an in-flight run finish rather than cancel it.
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_URL: https://github.com/jax-ml/jax-triton.git
+  # All automation branches live under this prefix; one unique branch per sync
+  # so that stacked PRs can coexist. Prefix `z_` is meant to safely hide sync branches
+  # to the very bottom of alphabet-sorted list of branches of the repo (tilde ~ symbol
+  # might cause conflicts if used without a due care)
+  SYNC_PREFIX: z_automation/upstream-sync/
+  BASE_BRANCH: amd-main
+  # gh CLI authenticates from GH_TOKEN. Must carry workflow scope (see header).
+  GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sync-and-propose:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (full history, push-capable token)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          # Persisted for subsequent `git push`. MUST be a workflow-scoped token.
+          token: ${{ secrets.SYNC_TOKEN }}
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          set -euo pipefail
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      # -----------------------------------------------------------------------
+      # STEP 1: Fetch upstream/main. We integrate its tip directly into amd-main;
+      #         there is no local mirror branch.
+      # -----------------------------------------------------------------------
+      - name: Fetch upstream/main
+        id: upstream
+        run: |
+          set -euo pipefail
+
+          # Add the upstream remote idempotently and fetch the branch we integrate.
+          git remote get-url upstream >/dev/null 2>&1 || git remote add upstream "$UPSTREAM_URL"
+          git fetch --prune upstream main
+
+          # NEW_MAIN is the upstream tip we integrate into amd-main. The amd-main
+          # side pins .github to the base's copy, so upstream's .github is ignored.
+          NEW_MAIN="$(git rev-parse upstream/main)"
+          echo "Upstream tip: ${NEW_MAIN}"
+          echo "new_main=${NEW_MAIN}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # STEP 2 + 3: Evaluate the prospective merge into the stacking base
+      #             (ignoring .github), and build/push a new PR branch if needed.
+      #
+      # Stacking base selection:
+      #   * Walk the open sync-PR chain from `amd-main` and branch off its tip,
+      #     opening the new PR with that tip branch as its base (clean,
+      #     incremental diff per sync).
+      #   * If no open sync PR chains back to `amd-main`, branch off `amd-main`.
+      # -----------------------------------------------------------------------
+      - name: Evaluate and build sync branch
+        id: evaluate
+        run: |
+          set -euo pipefail
+
+          NEW_MAIN="${{ steps.upstream.outputs.new_main }}"
+
+          # --- Pick the stacking base by walking the OPEN sync-PR chain. -------
+          # Start at amd-main; repeatedly find an open sync PR whose base is the
+          # current branch and advance to its head. The end of the chain is the
+          # tip we stack onto. A gap (a closed/retargeted PR) simply stops the
+          # walk, so this is robust to PRs being closed or modified out of band.
+          OPEN_SYNC_PRS="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+            --json number,headRefName,baseRefName,createdAt --limit 500 2>/dev/null \
+            | jq --arg p "$SYNC_PREFIX" '[ .[] | select(.headRefName | startswith($p)) ]' \
+            || echo '[]')"
+
+          BASE_PR_NUMBER=""
+          BASE_HEAD="$BASE_BRANCH"
+          VISITED=""
+          while : ; do
+            NEXT="$(printf '%s' "$OPEN_SYNC_PRS" | jq -r --arg c "$BASE_HEAD" '
+              [ .[] | select(.baseRefName == $c) ] | sort_by(.createdAt) | last
+              | if . == null then "" else "\(.number)\t\(.headRefName)" end')"
+            [ -z "$NEXT" ] && break
+            NUM="${NEXT%%$'\t'*}"
+            HEAD="${NEXT#*$'\t'}"
+            # Cycle guard (should never trigger, but never loop forever).
+            case " ${VISITED} " in *" ${HEAD} "*) break ;; esac
+            VISITED="${VISITED} ${HEAD}"
+            BASE_PR_NUMBER="$NUM"
+            BASE_HEAD="$HEAD"
+          done
+
+          if [ -n "$BASE_PR_NUMBER" ]; then
+            echo "Stacking on open sync PR #${BASE_PR_NUMBER} (tip branch ${BASE_HEAD})."
+          else
+            echo "No open sync chain rooted at ${BASE_BRANCH}; basing on ${BASE_BRANCH}."
+          fi
+
+          # Make sure the base ref is available locally, then resolve its tip.
+          git fetch --prune origin "$BASE_HEAD"
+          BASE_TIP="$(git rev-parse "origin/${BASE_HEAD}")"
+
+          # Fast path: if the upstream tip is already contained in the base,
+          # there is nothing to sync.
+          if git merge-base --is-ancestor "$NEW_MAIN" "$BASE_TIP"; then
+            echo "Base (origin/${BASE_HEAD}) already contains upstream tip ${NEW_MAIN}; no sync needed."
+            echo "need_pr=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # OLD_MAIN = newest upstream commit already contained in the base, so
+          # OLD_MAIN..NEW_MAIN is exactly the upstream work this PR introduces
+          # relative to its base (also correct for stacked PRs). Used for the PR
+          # body/commit message only.
+          OLD_MAIN="$(git merge-base "$NEW_MAIN" "$BASE_TIP")"
+
+          # --- Trial merge on a throwaway branch to evaluate the result. -------
+          # We intentionally do NOT rely on a `merge=ours` .gitattributes driver
+          # here: it isn't configured on the runner and GitHub wouldn't run it
+          # anyway. We enforce the base's .github explicitly, below.
+          git checkout -B _sync_trial "$BASE_TIP"
+
+          if git merge --no-ff --no-commit "$NEW_MAIN"; then
+            echo "Trial merge produced no conflicts."
+          else
+            echo "Trial merge reported conflicts; inspecting after .github is pinned."
+          fi
+
+          # Force .github to be EXACTLY the base's, regardless of what the merge
+          # did (resolves any .github conflicts to the base and drops any
+          # upstream-only .github files). The base's .github is itself amd-main's
+          # (every sync branch pins it), so amd-main's .github stays sovereign and
+          # the stacked diff shows zero .github churn. Core protection mechanism.
+          git rm -r --quiet --cached --ignore-unmatch .github
+          rm -rf .github
+          git checkout "$BASE_TIP" -- .github
+          git add -A .github
+
+          # Remaining conflicts are, by construction, outside .github.
+          REMAINING_CONFLICTS="$(git diff --name-only --diff-filter=U || true)"
+          if [ -n "$REMAINING_CONFLICTS" ]; then
+            HAS_CONFLICTS=true
+          else
+            HAS_CONFLICTS=false
+          fi
+
+          # Decide whether there is anything to sync (diff excluding .github).
+          NEED_PR=false
+          if [ "$HAS_CONFLICTS" = "true" ]; then
+            # Conflicts imply overlapping changes -> definitely something to sync.
+            NEED_PR=true
+          else
+            # Compare merged index vs the base, excluding .github.
+            if git diff --cached --quiet -- . ':(exclude).github'; then
+              NEED_PR=false
+            else
+              NEED_PR=true
+            fi
+          fi
+
+          if [ "$NEED_PR" != "true" ]; then
+            echo "No non-.github changes to sync; skipping PR."
+            echo "need_pr=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Unique branch name per sync so stacked PRs can coexist.
+          NEW_BRANCH="${SYNC_PREFIX}$(date -u +%Y%m%dT%H%M%SZ)-${NEW_MAIN:0:7}"
+
+          # --- Build the PR head branch (hybrid strategy). ---------------------
+          if [ "$HAS_CONFLICTS" = "false" ]; then
+            # CLEAN: finish the trial merge into a proper merge commit. The PR
+            # diff will be exactly the upstream, non-.github changes vs the base.
+            git commit \
+              -m "Merge upstream/main into ${BASE_HEAD} (keep ${BASE_BRANCH}'s .github)" \
+              -m "Integrated upstream/main onto ${BASE_HEAD}. .github/ is pinned to the base; upstream .github changes are not synced." \
+              -m "Upstream commits in this PR: ${OLD_MAIN}..${NEW_MAIN}"
+            git branch -M "$NEW_BRANCH"
+          else
+            # CONFLICT: discard the trial merge and instead publish a branch made
+            # of upstream/main + one commit that pins .github to the base's
+            # version. GitHub will surface the genuine conflicts natively and
+            # block merging until a human resolves them.
+            git merge --abort 2>/dev/null || git reset --hard "$BASE_TIP"
+            git checkout -B "$NEW_BRANCH" "$NEW_MAIN"
+            git rm -r --quiet --cached --ignore-unmatch .github
+            rm -rf .github
+            git checkout "$BASE_TIP" -- .github
+            git add -A .github
+            if ! git diff --cached --quiet; then
+              git commit \
+                -m "ci: pin .github to ${BASE_BRANCH} (do not sync upstream .github)" \
+                -m "${BASE_BRANCH} owns .github/. Making .github on this branch identical to the base means merging this PR is a no-op for .github, while GitHub still surfaces the genuine conflicts in the rest of the tree for manual resolution." \
+                -m "Upstream commits in this PR: ${OLD_MAIN}..${NEW_MAIN}"
+            fi
+          fi
+
+          # Unique branch name -> a plain push; never clobbers existing PRs.
+          git push origin "$NEW_BRANCH"
+
+          {
+            echo "need_pr=true"
+            echo "has_conflicts=${HAS_CONFLICTS}"
+            echo "new_branch=${NEW_BRANCH}"
+            echo "base_head=${BASE_HEAD}"
+            echo "base_pr_number=${BASE_PR_NUMBER}"
+            echo "old_main=${OLD_MAIN}"
+          } >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Open the pull request
+      # -----------------------------------------------------------------------
+      - name: Open sync pull request
+        if: steps.evaluate.outputs.need_pr == 'true'
+        run: |
+          set -euo pipefail
+
+          OLD_MAIN="${{ steps.evaluate.outputs.old_main }}"
+          NEW_MAIN="${{ steps.upstream.outputs.new_main }}"
+          HAS_CONFLICTS="${{ steps.evaluate.outputs.has_conflicts }}"
+          NEW_BRANCH="${{ steps.evaluate.outputs.new_branch }}"
+          BASE_HEAD="${{ steps.evaluate.outputs.base_head }}"
+          BASE_PR_NUMBER="${{ steps.evaluate.outputs.base_pr_number }}"
+
+          BODY_FILE="$(mktemp)"
+          {
+            echo "Automated sync of \`upstream/main\`, targeting \`${BASE_HEAD}\`."
+            echo
+            if [ -n "$BASE_PR_NUMBER" ]; then
+              echo "## Stacked PR"
+              echo "**This PR is stacked on #${BASE_PR_NUMBER} (its base is \`${BASE_HEAD}\`)."
+              echo "That previous PR must be merged first, as this one is based on it.**"
+              echo "Merge the stack bottom-up (oldest first)."
+              echo
+            fi
+            echo "## What this PR does"
+            echo "- Integrates the latest \`upstream/main\` commits onto \`${BASE_HEAD}\`."
+            echo "- **\`.github/\` is intentionally NOT synced** - \`${BASE_BRANCH}\` keeps its own copy."
+            echo
+            echo "## Upstream commits included in this PR"
+            echo '```'
+            git log --oneline --no-decorate "${OLD_MAIN}..${NEW_MAIN}" | head -250 || true
+            echo '```'
+            COUNT="$(git rev-list --count "${OLD_MAIN}..${NEW_MAIN}" 2>/dev/null || echo '?')"
+            echo "_Total: ${COUNT} commit(s) in range \`${OLD_MAIN}..${NEW_MAIN}\`._"
+            echo
+            if [ "$HAS_CONFLICTS" = "true" ]; then
+              echo "## Merge conflicts present"
+              echo "This branch conflicts with \`${BASE_HEAD}\`. **Resolve the conflicts"
+              echo "manually in this PR** - the automation deliberately does not resolve them."
+              echo
+            fi
+            echo "## How to merge  (IMPORTANT)"
+            echo "Use **\"Create a merge commit\"**. Do **NOT** squash and do **NOT** rebase-merge."
+            echo
+            echo "A merge commit records that \`${BASE_HEAD}\` now contains \`upstream/main\`'s commits as"
+            echo "ancestors, so the next sync treats them as already-integrated and only"
+            echo "brings in genuinely new work. Squashing or rebasing rewrites/collapses the"
+            echo "upstream commit IDs, breaking that ancestry link - every subsequent run would"
+            echo "then re-detect the same upstream changes as \"new\" and regenerate conflicts."
+            echo "If that happens, re-linking commit has to be added to the base branch manually"
+            echo "by executing 'git merge -s ours <upstream-tip>' (safe only when the "
+            echo "already-merged content matches that tip)."
+          } > "$BODY_FILE"
+
+          TITLE="[Automation] Sync upstream/main -> ${BASE_HEAD}"
+          if [ "$HAS_CONFLICTS" = "true" ]; then
+            TITLE="${TITLE} (conflicts - manual resolution required)"
+          fi
+
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base "$BASE_HEAD" \
+            --head "$NEW_BRANCH" \
+            --title "$TITLE" \
+            --body-file "$BODY_FILE"
+
+      # -----------------------------------------------------------------------
+      # Delete stale automation branches: any branch under SYNC_PREFIX that is
+      # no longer referenced by an OPEN PR (neither as head nor as base). This
+      # reaps branches of merged/closed PRs while never breaking a still-open
+      # (even orphaned) PR that still points at one. Runs regardless of whether a
+      # PR was opened this cycle.
+      # -----------------------------------------------------------------------
+      - name: Clean up stale sync branches
+        if: always()
+        run: |
+          set -euo pipefail
+
+          # Branch names under the prefix that currently exist on origin.
+          REMOTE_BRANCHES="$(git ls-remote --heads origin \
+            | sed 's#^.*refs/heads/##' \
+            | grep "^${SYNC_PREFIX}" || true)"
+          if [ -z "$REMOTE_BRANCHES" ]; then
+            echo "No automation branches to consider."
+            exit 0
+          fi
+
+          # Names referenced by ANY open PR (head or base). If we cannot list
+          # PRs, skip cleanup entirely rather than risk deleting live branches.
+          REF_JSON="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+            --json headRefName,baseRefName --limit 500 2>/dev/null)" || {
+            echo "warning: could not list open PRs; skipping cleanup to stay safe."
+            exit 0
+          }
+          REFERENCED="$(printf '%s' "$REF_JSON" | jq -r '.[] | .headRefName, .baseRefName' | sort -u)"
+
+          while IFS= read -r b; do
+            [ -z "$b" ] && continue
+            if printf '%s\n' "$REFERENCED" | grep -qxF -- "$b"; then
+              echo "keep (referenced by an open PR): $b"
+            else
+              echo "delete stale branch: $b"
+              git push origin --delete "$b" || echo "  warning: could not delete $b"
+            fi
+          done <<< "$REMOTE_BRANCHES"
