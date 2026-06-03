@@ -39,7 +39,16 @@
 #       - Conflicts     -> the PR head is `upstream/main` + one commit pinning
 #         `.github` to amd-main's version. GitHub then surfaces the real
 #         conflicts in its native UI and BLOCKS merging until a human resolves
-#         them. We never commit conflict markers.
+#         them. We never commit conflict markers. The PR body carries (a) a
+#         CI-generated per-file "real delta" report - the minimal text diff
+#         between the two sides of each conflict, so reviewers see the few
+#         genuine changes instead of two large look-alike blocks - and (b) a
+#         resolve-and-flip recipe: the maintainer merges
+#         `upstream/main` INTO the base locally (correct direction: keeps the
+#         base on the first-parent spine and `git blame` intact), then
+#         force-pushes the resolved merge back onto this automation branch,
+#         which flips the PR into a clean, mergeable diff. That is then merged
+#         with "Create a merge commit" like any clean sync PR.
 #
 #   * Stacked PRs. If a sync PR is already open, we do NOT touch it. Instead we
 #     find the tip of the open sync-PR chain by WALKING base->head links starting
@@ -190,6 +199,7 @@ jobs:
         id: evaluate
         run: |
           set -euo pipefail
+          set -x  # helps to deal with uncertain output.
 
           NEW_MAIN="${{ steps.upstream.outputs.new_main }}"
 
@@ -311,6 +321,39 @@ jobs:
             # of upstream/main + one commit that pins .github to the base's
             # version. GitHub will surface the genuine conflicts natively and
             # block merging until a human resolves them.
+            #
+            # First, WHILE THE TRIAL MERGE IS STILL IN PROGRESS (stage 2 = base /
+            # amd-main side, stage 3 = upstream side), capture a minimal per-file
+            # "real delta" report for the PR body: the small textual diff between
+            # the two conflicting sides. This keeps review easy even when the raw
+            # conflict markers span large look-alike blocks. CI makes NO
+            # resolution decision here - it only describes the difference.
+            # Timestamped name so reports from different runs never collide
+            # (e.g. on self-hosted runners that reuse RUNNER_TEMP).
+            CONFLICT_REPORT="${RUNNER_TEMP:-/tmp}/conflict_report-$(date -u +%Y%m%dT%H%M%SZ).md"
+            : > "$CONFLICT_REPORT"
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              o="$(mktemp)"; t="$(mktemp)"
+              git show ":2:$f" > "$o" 2>/dev/null || : > "$o"   # ours   = base (amd-main)
+              git show ":3:$f" > "$t" 2>/dev/null || : > "$t"   # theirs = upstream
+              {
+                printf '### `%s`\n\n' "$f"
+                if cmp -s "$o" "$t"; then
+                  printf '_Both sides are byte-identical; safe to take either side._\n\n'
+                else
+                  printf '```diff\n'
+                  # histogram + word-diff isolates the genuine tweaks; awk drops the
+                  # temp-path file header and keeps only the @@ hunks.
+                  git --no-pager diff --no-index --diff-algorithm=histogram \
+                    --word-diff=plain -- "$o" "$t" 2>/dev/null \
+                    | awk 'p||/^@@/{p=1; print}' | head -200 || true
+                  printf '```\n\n'
+                fi
+              } >> "$CONFLICT_REPORT"
+              rm -f "$o" "$t"
+            done <<< "$REMAINING_CONFLICTS"
+
             git merge --abort 2>/dev/null || git reset --hard "$BASE_TIP"
             git checkout -B "$NEW_BRANCH" "$NEW_MAIN"
             git rm -r --quiet --cached --ignore-unmatch .github
@@ -335,6 +378,7 @@ jobs:
             echo "base_head=${BASE_HEAD}"
             echo "base_pr_number=${BASE_PR_NUMBER}"
             echo "old_main=${OLD_MAIN}"
+            echo "conflict_report=${CONFLICT_REPORT:-}"
           } >> "$GITHUB_OUTPUT"
 
       # -----------------------------------------------------------------------
@@ -351,6 +395,7 @@ jobs:
           NEW_BRANCH="${{ steps.evaluate.outputs.new_branch }}"
           BASE_HEAD="${{ steps.evaluate.outputs.base_head }}"
           BASE_PR_NUMBER="${{ steps.evaluate.outputs.base_pr_number }}"
+          CONFLICT_REPORT_PATH="${{ steps.evaluate.outputs.conflict_report }}"
 
           BODY_FILE="$(mktemp)"
           {
@@ -375,10 +420,61 @@ jobs:
             echo "_Total: ${COUNT} commit(s) in range \`${OLD_MAIN}..${NEW_MAIN}\`._"
             echo
             if [ "$HAS_CONFLICTS" = "true" ]; then
-              echo "## Merge conflicts present"
-              echo "This branch conflicts with \`${BASE_HEAD}\`. **Resolve the conflicts"
-              echo "manually in this PR** - the automation deliberately does not resolve them."
+              echo "## Merge conflicts - resolve locally, then flip this PR to clean"
               echo
+              echo "This PR's head is \`upstream/main\` (+ a \`.github\` pin), so GitHub shows the"
+              echo "genuine conflicts and **blocks the merge button**. The automation never"
+              echo "resolves conflicts itself."
+              echo
+              echo "**Do NOT** use GitHub's web \"Resolve conflicts\" editor: it merges"
+              echo "\`${BASE_HEAD}\` INTO upstream (wrong direction). Instead resolve **locally**, by"
+              echo "merging upstream **INTO \`${BASE_HEAD}\`** - this keeps \`${BASE_BRANCH}\` on the"
+              echo "first-parent spine and \`git blame\` intact - then force-push the resolved merge"
+              echo "back onto this branch so the PR becomes a clean, mergeable diff:"
+              echo
+              echo '```bash'
+              echo "# readable, minimal conflict markers (optional, recommended)"
+              echo "git config merge.conflictStyle zdiff3"
+              echo
+              echo "git remote get-url upstream >/dev/null 2>&1 || git remote add upstream ${UPSTREAM_URL}"
+              echo "git fetch upstream main"
+              echo "git fetch origin ${BASE_HEAD}"
+              echo "git checkout ${BASE_HEAD}"
+              echo
+              echo "# correct direction: upstream INTO ${BASE_HEAD}"
+              echo "git merge --no-ff -X diff-algorithm=histogram ${NEW_MAIN}"
+              echo
+              echo "# see ONLY the real per-file delta between the two conflicting sides:"
+              echo "for f in \$(git diff --name-only --diff-filter=U); do"
+              echo "  echo \"=== \$f ===\""
+              echo "  git --no-pager diff --no-index --word-diff=plain \\"
+              echo "    <(git show \":2:\$f\") <(git show \":3:\$f\") || true"
+              echo "done"
+              echo
+              echo "# ...resolve every conflicted file, then keep ${BASE_BRANCH}'s .github sovereign:"
+              echo "git rm -r --quiet --cached --ignore-unmatch .github"
+              echo "rm -rf .github && git checkout HEAD -- .github && git add -A .github"
+              echo
+              echo "git commit                                   # finish the upstream->${BASE_HEAD} merge"
+              echo "git push --force-with-lease origin HEAD:${NEW_BRANCH}"
+              echo '```'
+              echo
+              echo "After the force-push, this branch already contains \`${BASE_HEAD}\`, so the"
+              echo "conflict clears and the PR diff shows only upstream's net changes. Merge it"
+              echo "with **\"Create a merge commit\"** (see below)."
+              echo
+              if [ -n "$CONFLICT_REPORT_PATH" ] && [ -s "$CONFLICT_REPORT_PATH" ]; then
+                echo "<details><summary><b>CI-computed real delta per conflicted file (ours = \`${BASE_BRANCH}\`, theirs = upstream)</b></summary>"
+                echo
+                echo "_The minimal textual difference between the two sides of each conflict -"
+                echo "usually only a few lines, even when the raw conflict markers span large"
+                echo "look-alike blocks. Generated by CI from the trial merge; no resolution was"
+                echo "made by the automation._"
+                echo
+                cat "$CONFLICT_REPORT_PATH"
+                echo "</details>"
+                echo
+              fi
             fi
             echo "## How to merge  (IMPORTANT)"
             echo "Use **\"Create a merge commit\"**. Do **NOT** squash and do **NOT** rebase-merge."
@@ -392,6 +488,12 @@ jobs:
             echo "by executing 'git merge -s ours <upstream-tip>' (safe only when the "
             echo "already-merged content matches that tip)."
           } > "$BODY_FILE"
+
+          # The conflict report (if any) has now been folded into the PR body;
+          # it is no longer needed, so drop the temp file.
+          if [ -n "$CONFLICT_REPORT_PATH" ]; then
+            rm -f "$CONFLICT_REPORT_PATH"
+          fi
 
           TITLE="[Automation] Sync upstream/main -> ${BASE_HEAD}"
           if [ "$HAS_CONFLICTS" = "true" ]; then
