@@ -14,6 +14,8 @@
 
 """Module for calling Triton or Triton.Gluon kernels from JAX."""
 
+from __future__ import annotations
+
 from collections.abc import Callable, Sequence
 import copy
 import functools
@@ -38,17 +40,23 @@ from jax.interpreters import mlir
 from jax.interpreters import xla
 import jax.numpy as jnp
 import numpy as np
-
-
 import triton
+import triton._C.libtriton as _triton
 import triton.compiler.compiler as tc
+import triton.experimental.gluon._runtime as gl_runtime
 import triton.runtime.autotuner as autotuner
 import triton.runtime.jit as triton_runtime_jit
-import triton._C.libtriton as _triton
-import triton.backends.nvidia.compiler as cb
-import triton.backends.amd.compiler as hb
 
-import triton.experimental.gluon._runtime as gl_runtime
+
+try:
+  import triton.backends.nvidia.compiler as cb
+except ImportError:
+  cb = None  # NVIDIA backend is not available.
+
+try:
+  import triton.backends.amd.compiler as hb
+except ImportError:
+  hb = None  # AMD backend is not available.
 
 
 if "TRITON_CACHE_DIR" in os.environ:
