@@ -211,7 +211,7 @@ jobs:
           OPEN_SYNC_PRS="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
             --json number,headRefName,baseRefName,createdAt --limit 500 2>/dev/null \
             | jq --arg p "$SYNC_PREFIX" '[ .[] | select(.headRefName | startswith($p)) ]' \
-            || echo '[]')"
+            )"
 
           BASE_PR_NUMBER=""
           BASE_HEAD="$BASE_BRANCH"
@@ -277,7 +277,7 @@ jobs:
           git add -A .github
 
           # Remaining conflicts are, by construction, outside .github.
-          REMAINING_CONFLICTS="$(git diff --name-only --diff-filter=U || true)"
+          REMAINING_CONFLICTS="$(git diff --name-only --diff-filter=U)"
           if [ -n "$REMAINING_CONFLICTS" ]; then
             HAS_CONFLICTS=true
           else
@@ -347,7 +347,7 @@ jobs:
                   # temp-path file header and keeps only the @@ hunks.
                   git --no-pager diff --no-index --diff-algorithm=histogram \
                     --word-diff=plain -- "$o" "$t" 2>/dev/null \
-                    | awk 'p||/^@@/{p=1; print}' | head -200 || true
+                    | awk 'p||/^@@/{p=1; print}' | head -200
                   printf '```\n\n'
                 fi
               } >> "$CONFLICT_REPORT"
@@ -448,7 +448,7 @@ jobs:
               echo "for f in \$(git diff --name-only --diff-filter=U); do"
               echo "  echo \"=== \$f ===\""
               echo "  git --no-pager diff --no-index --word-diff=plain \\"
-              echo "    <(git show \":2:\$f\") <(git show \":3:\$f\") || true"
+              echo "    <(git show \":2:\$f\") <(git show \":3:\$f\")"
               echo "done"
               echo
               echo "# ...resolve every conflicted file, then keep ${BASE_BRANCH}'s .github sovereign:"
