@@ -120,7 +120,7 @@ on:
   schedule:
     # Daily (UTC). Note: GitHub may delay scheduled runs under load,
     # and auto-disables schedules after ~60 days of repository inactivity.
-    - cron: '34 8 * * *'
+    - cron: '34 5 * * *'
   workflow_dispatch:
 
 # Never run two syncs at once; let an in-flight run finish rather than cancel it.
