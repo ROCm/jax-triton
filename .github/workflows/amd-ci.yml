@@ -1,6 +1,9 @@
 name: CI ROCm
 
 on:
+  push:
+    branches:
+      - amd-main
   pull_request:
     branches:
       - amd-main
@@ -17,6 +20,6 @@ jobs:
     runs-on: linux-jax-triton-mi350-1
 
     steps:
-      - name: Verify workflow run
-        run: echo "CI ROCm"
+      - name:  Verify ROCm runner
+        run: rocminfo
 
