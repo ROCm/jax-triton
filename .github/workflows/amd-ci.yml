@@ -1,25 +1,199 @@
-name: CI ROCm
+# =============================================================================
+# CI - ROCm
+# =============================================================================
+#
+# PURPOSE
+#   Validate jax-triton on ROCm against both the latest released JAX and the
+#   latest upstream JAX. The workflow installs the appropriate JAX stack,
+#   pins Triton to the validated version, installs jax-triton from the current
+#   branch, and runs `pytest -vs tests/`.
+# =============================================================================
+name: CI - ROCm
 
 on:
-  push:
-    branches:
-      - amd-main
   pull_request:
-    branches:
-      - amd-main
+  workflow_dispatch:
+    inputs:
+      rocm-version:
+        description: "Which ROCm version to test? (used for plugin namespace + S3 wheel resolution)"
+        type: string
+        default: "7.2.0"
+      rocm-tag:
+        description: "ROCm tag for the base container image (e.g., rocm720)"
+        type: string
+        default: "rocm720"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  test:
+  pytest:
+    name: "pytest tests (jax=${{ matrix.jax-source }}, py${{ matrix.python }})"
     runs-on: linux-jax-triton-mi350-1
+    strategy:
+      fail-fast: false
+      matrix:
+        jax-source: [released, upstream]
+        python: ["3.12", "3.13", "3.14"]
+
+    defaults:
+      run:
+        shell: bash
+
+    container:
+      image: ghcr.io/rocm/jax-base-ubu24.${{ inputs.rocm-tag || 'rocm720' }}:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      volumes:
+        - /etc/podinfo:/etc/podinfo:ro
+      options: >-
+        --device=/dev/kfd
+        --device=/dev/dri
+        --group-add video
+        --cap-add=SYS_PTRACE
+        --security-opt seccomp=unconfined
+        --shm-size 64G
+
+    env:
+      PYTHON_VERSION: ${{ matrix.python }}
+      JAXCI_PYTHON: "python${{ matrix.python }}"
+      ROCM_VERSION: ${{ inputs.rocm-version || '7.2.0' }}
+      # Cloudfront end for ROCm head-wheel (plugin + pjrt).
+      ROCM_WHEELS_BASE_URL: "https://d22q5eopkfeftw.cloudfront.net"
+      # GCS bucket for the latest upstream `jax` wheels.
+      JAX_NIGHTLY_GCS_URI: "gs://jax-nightly-artifacts/latest"
 
     steps:
-      - name:  Verify ROCm runner
-        run: rocminfo
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
+      - name: System info
+        run: |
+          set -eux
+          "$JAXCI_PYTHON" --version
+          rocm-smi || true
+          rocminfo || true
+
+      - name: Scope to pod-allocated GPUs
+        run: |
+          set -eux
+          cat /etc/podinfo/gha-render-devices 2>/dev/null || true
+          # Restrict the job to the GPUs allocated to this pod.
+          # renderD<N> -> GPU index (renderD128 = 0).
+          all=$(ls -1 /sys/class/drm/ 2>/dev/null | grep -oE 'renderD[0-9]+' | sort -t D -k2 -n)
+          want=$(grep -oE 'renderD[0-9]+' /etc/podinfo/gha-render-devices 2>/dev/null | sort -u)
+          ids=""
+          if [[ -n "$all" && -n "$want" ]]; then
+            for w in $want; do
+              idx=$(echo "$all" | grep -nxF "$w" | cut -d: -f1)
+              [[ -n "$idx" ]] && ids="${ids:+$ids,}$((idx-1))"
+            done
+          fi
+          if [[ -n "$ids" ]]; then
+            echo "ROCR_VISIBLE_DEVICES=$ids" >> "$GITHUB_ENV"
+          fi
+          echo "Scoped GPUs: ${ids:-all}"
+
+      - name: Resolve ROCm plugin namespace
+        id: rocm
+        run: |
+          set -eux
+          # ROCm plugin/PJRT package names depend on the ROCm major version.
+          # ROCm 6.x uses the "60" namespace; ROCm 7.x uses "7".
+          rocm_major="${ROCM_VERSION%%.*}"
+          if [[ "${rocm_major}" == "6" ]]; then
+            plugin_ns="60"
+          else
+            plugin_ns="${rocm_major}"
+          fi
+          echo "plugin_ns=${plugin_ns}" >> "$GITHUB_OUTPUT"
+
+      - name: Install JAX (latest release from PyPI)
+        if: matrix.jax-source == 'released'
+        env:
+          PLUGIN_NS: ${{ steps.rocm.outputs.plugin_ns }}
+        run: |
+          set -eux
+          # The base image provides ROCm and Python, but not JAX.
+          "$JAXCI_PYTHON" -m pip install --upgrade --break-system-packages \
+            jax jaxlib \
+            "jax-rocm${PLUGIN_NS}-pjrt" "jax-rocm${PLUGIN_NS}-plugin"
+
+      - name: Install JAX (latest from upstream / head wheels)
+        if: matrix.jax-source == 'upstream'
+        env:
+          PLUGIN_NS: ${{ steps.rocm.outputs.plugin_ns }}
+        run: |
+          set -eux
+          # Python wheel tag, e.g. 3.12 -> cp312-cp312-
+          python_major_minor=$(echo "${PYTHON_VERSION}" | tr -d '.')
+          python_tag="cp${python_major_minor}-cp${python_major_minor}-"
+
+          mkdir -p "$(pwd)/dist"
+
+          # Download upstream JAX and jaxlib wheels.
+          gcloud config set auth/disable_credentials True
+          gcloud storage cp "${JAX_NIGHTLY_GCS_URI}"/jax*py3*none*any.whl "$(pwd)/dist/"
+          gcloud storage cp "${JAX_NIGHTLY_GCS_URI}/jaxlib-"*"${python_tag}"*manylinux*x86_64.whl "$(pwd)/dist/"
+
+          # Resolve the latest ROCm plugin/PJRT wheels for jax-ml/jax main.
+          latest_key="rocm-wheels/jax-ml/jax/main/${ROCM_VERSION}/LATEST"
+          resolved_s3_uri=$(curl -fsSL "${ROCM_WHEELS_BASE_URL}/${latest_key}" | tr -d '[:space:]')
+          wheels_path="${resolved_s3_uri#s3://jax-ci-amd/}"
+          wheels_url="${ROCM_WHEELS_BASE_URL}/${wheels_path%/}"
+          echo "Resolved head wheels URL: ${wheels_url}"
+
+          listing=$(curl -fsSL "${wheels_url}/")
+          files=$(echo "$listing" | grep -oE 'href="[^"]+\.whl"' | cut -d'"' -f2 || true)
+          pjrt_file=$(echo "$files" | grep "jax_rocm${PLUGIN_NS}_pjrt-" | head -n1 || true)
+          plugin_file=$(echo "$files" | grep "jax_rocm${PLUGIN_NS}_plugin-" | grep "${python_tag}" | head -n1 || true)
+
+          if [[ -z "${pjrt_file}" || -z "${plugin_file}" ]]; then
+            echo "ERROR: could not find head pjrt/plugin wheels under ${wheels_url}"
+            echo "Found wheels:"
+            echo "$files"
+            exit 1
+          fi
+
+          "$JAXCI_PYTHON" -m pip download --no-deps --dest "$(pwd)/dist" \
+            "${wheels_url}/${pjrt_file}" \
+            "${wheels_url}/${plugin_file}"
+
+          ls -lah "$(pwd)/dist"
+          "$JAXCI_PYTHON" -m pip install --break-system-packages "$(pwd)"/dist/*.whl
+
+      - name: Pin triton 3.6.0
+        run: |
+          set -eux
+          # Pin Triton before installing jax-triton. Otherwise pip resolves
+          # Triton 3.7.x, which is not yet validated here.
+          "$JAXCI_PYTHON" -m pip install --break-system-packages "triton==3.6.0"
+
+      - name: Install jax-triton
+        run: |
+          set -eux
+          "$JAXCI_PYTHON" -m pip install --break-system-packages .
+          "$JAXCI_PYTHON" -m pip install --break-system-packages pytest
+
+      - name: Show installed JAX / triton / jax-triton
+        run: |
+          set -eux
+          "$JAXCI_PYTHON" -m pip freeze | grep -Ei "^(jax|jaxlib|jax-rocm|jax-triton|triton)" || true
+          "$JAXCI_PYTHON" -c "import jax; print('backend:', jax.default_backend()); print('devices:', jax.devices())"
+
+      - name: Run pytest -vs tests
+        timeout-minutes: 120
+        env:
+          PY_COLORS: "1"
+          XLA_PYTHON_CLIENT_ALLOCATOR: default
+          XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+        run: |
+          set -eux
+          "$JAXCI_PYTHON" -m pytest -vs tests
