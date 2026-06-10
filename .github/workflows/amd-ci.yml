@@ -1,0 +1,22 @@
+name: CI ROCm
+
+on:
+  pull_request:
+    branches:
+      - amd-main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: linux-jax-triton-mi350-1
+
+    steps:
+      - name: Verify workflow run
+        run: echo "CI ROCm"
+
