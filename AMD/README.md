@@ -1,0 +1,3 @@
+This directory is a home for AMD specific tests, most if not all of which are also GPU-architecture specific.
+
+Note that for running benchmarks you would need to `pip install benchstats` first.
