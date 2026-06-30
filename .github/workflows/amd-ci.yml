@@ -44,22 +44,9 @@ jobs:
       run:
         shell: bash
 
-    container:
-      image: ghcr.io/rocm/jax-base-ubu24.${{ inputs.rocm-tag || 'rocm720' }}:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      volumes:
-        - /etc/podinfo:/etc/podinfo:ro
-      options: >-
-        --device=/dev/kfd
-        --device=/dev/dri
-        --group-add video
-        --cap-add=SYS_PTRACE
-        --security-opt seccomp=unconfined
-        --shm-size 64G
-
     env:
+      CONTAINER: jt-runner
+      IMAGE: ghcr.io/rocm/jax-base-ubu24.${{ inputs.rocm-tag || 'rocm720' }}:latest
       PYTHON_VERSION: ${{ matrix.python }}
       JAXCI_PYTHON: "python${{ matrix.python }}"
       ROCM_VERSION: ${{ inputs.rocm-version || '7.2.0' }}
@@ -74,32 +61,29 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Run container (scoped to pod-allocated GPUs)
+        run: |
+          set -eux
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$IMAGE"
+          device_flag="$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo --device=/dev/dri)"
+          test -n "$device_flag"
+          docker run -dt --name "$CONTAINER" --network=host \
+            --device=/dev/kfd $device_flag \
+            --group-add video --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined --shm-size 64G \
+            -v "$PWD:/workspace" -w /workspace \
+            "$IMAGE" sleep infinity
+
       - name: System info
         run: |
           set -eux
-          "$JAXCI_PYTHON" --version
-          rocm-smi || true
-          rocminfo || true
-
-      - name: Scope to pod-allocated GPUs
-        run: |
-          set -eux
-          cat /etc/podinfo/gha-render-devices 2>/dev/null || true
-          # Restrict the job to the GPUs allocated to this pod.
-          # renderD<N> -> GPU index (renderD128 = 0).
-          all=$(ls -1 /sys/class/drm/ 2>/dev/null | grep -oE 'renderD[0-9]+' | sort -t D -k2 -n)
-          want=$(grep -oE 'renderD[0-9]+' /etc/podinfo/gha-render-devices 2>/dev/null | sort -u)
-          ids=""
-          if [[ -n "$all" && -n "$want" ]]; then
-            for w in $want; do
-              idx=$(echo "$all" | grep -nxF "$w" | cut -d: -f1)
-              [[ -n "$idx" ]] && ids="${ids:+$ids,}$((idx-1))"
-            done
-          fi
-          if [[ -n "$ids" ]]; then
-            echo "ROCR_VISIBLE_DEVICES=$ids" >> "$GITHUB_ENV"
-          fi
-          echo "Scoped GPUs: ${ids:-all}"
+          docker exec "$CONTAINER" bash -lc '
+            set -eux
+            '"$JAXCI_PYTHON"' --version
+            rocm-smi || true
+            rocminfo || true
+          '
 
       - name: Resolve ROCm plugin namespace
         id: rocm
@@ -121,10 +105,12 @@ jobs:
           PLUGIN_NS: ${{ steps.rocm.outputs.plugin_ns }}
         run: |
           set -eux
-          # The base image provides ROCm and Python, but not JAX.
-          "$JAXCI_PYTHON" -m pip install --upgrade --break-system-packages \
-            jax jaxlib \
-            "jax-rocm${PLUGIN_NS}-pjrt" "jax-rocm${PLUGIN_NS}-plugin"
+          docker exec -e PLUGIN_NS "$CONTAINER" bash -lc '
+            set -eux
+            '"$JAXCI_PYTHON"' -m pip install --upgrade --break-system-packages \
+              jax jaxlib \
+              "jax-rocm${PLUGIN_NS}-pjrt" "jax-rocm${PLUGIN_NS}-plugin"
+          '
 
       - name: Install JAX (latest from upstream / head wheels)
         if: matrix.jax-source == 'upstream'
@@ -132,68 +118,87 @@ jobs:
           PLUGIN_NS: ${{ steps.rocm.outputs.plugin_ns }}
         run: |
           set -eux
-          # Python wheel tag, e.g. 3.12 -> cp312-cp312-
-          python_major_minor=$(echo "${PYTHON_VERSION}" | tr -d '.')
-          python_tag="cp${python_major_minor}-cp${python_major_minor}-"
+          docker exec \
+            -e PLUGIN_NS \
+            -e PYTHON_VERSION \
+            -e ROCM_VERSION \
+            -e ROCM_WHEELS_BASE_URL \
+            -e JAX_NIGHTLY_GCS_URI \
+            "$CONTAINER" bash -lc '
+            set -eux
+            # Python wheel tag, e.g. 3.12 -> cp312-cp312-
+            python_major_minor=$(echo "${PYTHON_VERSION}" | tr -d ".")
+            python_tag="cp${python_major_minor}-cp${python_major_minor}-"
 
-          mkdir -p "$(pwd)/dist"
+            mkdir -p /workspace/dist
 
-          # Download upstream JAX and jaxlib wheels.
-          gcloud config set auth/disable_credentials True
-          gcloud storage cp "${JAX_NIGHTLY_GCS_URI}"/jax*py3*none*any.whl "$(pwd)/dist/"
-          gcloud storage cp "${JAX_NIGHTLY_GCS_URI}/jaxlib-"*"${python_tag}"*manylinux*x86_64.whl "$(pwd)/dist/"
+            # Download upstream JAX and jaxlib wheels.
+            gcloud config set auth/disable_credentials True
+            gcloud storage cp "${JAX_NIGHTLY_GCS_URI}"/jax*py3*none*any.whl /workspace/dist/
+            gcloud storage cp "${JAX_NIGHTLY_GCS_URI}/jaxlib-"*"${python_tag}"*manylinux*x86_64.whl /workspace/dist/
 
-          # Resolve the latest ROCm plugin/PJRT wheels for jax-ml/jax main.
-          latest_key="rocm-wheels/jax-ml/jax/main/${ROCM_VERSION}/LATEST"
-          resolved_s3_uri=$(curl -fsSL "${ROCM_WHEELS_BASE_URL}/${latest_key}" | tr -d '[:space:]')
-          wheels_path="${resolved_s3_uri#s3://jax-ci-amd/}"
-          wheels_url="${ROCM_WHEELS_BASE_URL}/${wheels_path%/}"
-          echo "Resolved head wheels URL: ${wheels_url}"
+            # Resolve the latest ROCm plugin/PJRT wheels for jax-ml/jax main.
+            latest_key="rocm-wheels/jax-ml/jax/main/${ROCM_VERSION}/LATEST"
+            resolved_s3_uri=$(curl -fsSL "${ROCM_WHEELS_BASE_URL}/${latest_key}" | tr -d "[:space:]")
+            wheels_path="${resolved_s3_uri#s3://jax-ci-amd/}"
+            wheels_url="${ROCM_WHEELS_BASE_URL}/${wheels_path%/}"
+            echo "Resolved head wheels URL: ${wheels_url}"
 
-          listing=$(curl -fsSL "${wheels_url}/")
-          files=$(echo "$listing" | grep -oE 'href="[^"]+\.whl"' | cut -d'"' -f2 || true)
-          pjrt_file=$(echo "$files" | grep "jax_rocm${PLUGIN_NS}_pjrt-" | head -n1 || true)
-          plugin_file=$(echo "$files" | grep "jax_rocm${PLUGIN_NS}_plugin-" | grep "${python_tag}" | head -n1 || true)
+            listing=$(curl -fsSL "${wheels_url}/")
+            files=$(echo "$listing" | grep -oE "href=\"[^\"]+\.whl\"" | cut -d"\"" -f2 || true)
+            pjrt_file=$(echo "$files" | grep "jax_rocm${PLUGIN_NS}_pjrt-" | head -n1 || true)
+            plugin_file=$(echo "$files" | grep "jax_rocm${PLUGIN_NS}_plugin-" | grep "${python_tag}" | head -n1 || true)
 
-          if [[ -z "${pjrt_file}" || -z "${plugin_file}" ]]; then
-            echo "ERROR: could not find head pjrt/plugin wheels under ${wheels_url}"
-            echo "Found wheels:"
-            echo "$files"
-            exit 1
-          fi
+            if [[ -z "${pjrt_file}" || -z "${plugin_file}" ]]; then
+              echo "ERROR: could not find head pjrt/plugin wheels under ${wheels_url}"
+              echo "Found wheels:"
+              echo "$files"
+              exit 1
+            fi
 
-          "$JAXCI_PYTHON" -m pip download --no-deps --dest "$(pwd)/dist" \
-            "${wheels_url}/${pjrt_file}" \
-            "${wheels_url}/${plugin_file}"
+            '"$JAXCI_PYTHON"' -m pip download --no-deps --dest /workspace/dist \
+              "${wheels_url}/${pjrt_file}" \
+              "${wheels_url}/${plugin_file}"
 
-          ls -lah "$(pwd)/dist"
-          "$JAXCI_PYTHON" -m pip install --break-system-packages "$(pwd)"/dist/*.whl
+            ls -lah /workspace/dist
+            '"$JAXCI_PYTHON"' -m pip install --break-system-packages /workspace/dist/*.whl
+          '
 
       - name: Pin triton 3.6.0
         run: |
           set -eux
           # Pin Triton before installing jax-triton. Otherwise pip resolves
           # Triton 3.7.x, which is not yet validated here.
-          "$JAXCI_PYTHON" -m pip install --break-system-packages "triton==3.6.0"
+          docker exec "$CONTAINER" bash -lc '
+            '"$JAXCI_PYTHON"' -m pip install --break-system-packages "triton==3.6.0"
+          '
 
       - name: Install jax-triton
         run: |
           set -eux
-          "$JAXCI_PYTHON" -m pip install --break-system-packages .
-          "$JAXCI_PYTHON" -m pip install --break-system-packages pytest
+          docker exec "$CONTAINER" bash -lc '
+            set -eux
+            '"$JAXCI_PYTHON"' -m pip install --break-system-packages .
+            '"$JAXCI_PYTHON"' -m pip install --break-system-packages pytest
+          '
 
       - name: Show installed JAX / triton / jax-triton
         run: |
           set -eux
-          "$JAXCI_PYTHON" -m pip freeze | grep -Ei "^(jax|jaxlib|jax-rocm|jax-triton|triton)" || true
-          "$JAXCI_PYTHON" -c "import jax; print('backend:', jax.default_backend()); print('devices:', jax.devices())"
+          docker exec "$CONTAINER" bash -lc '
+            set -eux
+            '"$JAXCI_PYTHON"' -m pip freeze | grep -Ei "^(jax|triton|jax-triton)" || true
+            '"$JAXCI_PYTHON"' -c "import jax; print(\"backend:\", jax.default_backend()); print(\"devices:\", jax.devices())"
+          '
 
       - name: Run pytest -vs tests
         timeout-minutes: 120
-        env:
-          PY_COLORS: "1"
-          XLA_PYTHON_CLIENT_ALLOCATOR: default
-          XLA_PYTHON_CLIENT_PREALLOCATE: "false"
         run: |
           set -eux
-          "$JAXCI_PYTHON" -m pytest -vs tests
+          docker exec \
+            -e PY_COLORS=1 \
+            -e XLA_PYTHON_CLIENT_ALLOCATOR=default \
+            -e XLA_PYTHON_CLIENT_PREALLOCATE=false \
+            "$CONTAINER" bash -lc '
+            '"$JAXCI_PYTHON"' -m pytest -vs tests
+          '
