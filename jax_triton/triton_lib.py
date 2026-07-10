@@ -33,7 +33,11 @@ from jax import tree_util
 from jax._src import core
 from jax._src import util
 from jax._src.lib import gpu_triton as triton_kernel_call_lib
-from jax._src.pallas.triton import gpu_info
+
+try:  # TODO(Arech): remove try block once gpu_info is in all supported versions
+  from jax._src.pallas.triton import gpu_info
+except ImportError:
+  gpu_info = None  # type: ignore
 import jax.extend as jex
 from jax.interpreters import ad
 from jax.interpreters import batching
@@ -351,8 +355,11 @@ def make_backend(
     try:
       compute_capability = triton_kernel_call_lib.get_compute_capability(device)
     except RuntimeError:
-      # TODO(slebedev): Consider *only* using ``gpu_info`` here.
-      compute_capability = gpu_info.get_gpu_info().compute_capability
+      if gpu_info is None:
+        # TODO(slebedev): Consider *only* using ``gpu_info`` here.
+        compute_capability = gpu_info.get_gpu_info().compute_capability
+      else:
+        raise RuntimeError("compute_capability is not available")
   if num_ctas > 1 and compute_capability < 90:
     raise ValueError("num_ctas > 1 unsupported before Hopper.")
 
