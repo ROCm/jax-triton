@@ -1,0 +1,230 @@
+# =============================================================================
+# Sync Merge Guard (post-merge detective check)
+# =============================================================================
+#
+# PURPOSE
+#   Verify two invariants for every merged sync PR (head branch under
+#   `z_automation/upstream-sync/`, produced by amd-sync-upstream2.yml):
+#
+#   1. ANCESTRY-PRESERVING MERGE. The PR was merged with a strategy that PRESERVES
+#      commit ancestry - i.e. "Create a merge commit" (a plain fast-forward also
+#      preserves it). "Squash and merge" and "Rebase and merge" rewrite/collapse
+#      the upstream commits into brand-new SHAs, so the original commits stop being
+#      ancestors of the base branch. That breaks the incremental detection in
+#      amd-sync-upstream2.yml (its `git merge-base --is-ancestor` fast path and its
+#      merge-base computation), causing redundant re-merges, spurious conflicts,
+#      and duplicate sync PRs.
+#
+#   2. NO `.github/` MODIFICATION. The merge changed nothing under `.github/`. The
+#      base branch owns its own `.github/`, and every sync branch pins `.github/`
+#      to the base (see amd-sync-upstream2.yml), so a sync merge MUST be a no-op
+#      there. A non-empty `.github/` delta means the upstream `.github/` leaked in -
+#      typically through a manual conflict resolution that let the upstream side
+#      win under `.github/`.
+#
+# HOW IT DETECTS (directly tests the invariants, instead of guessing the method)
+#   1. ANCESTRY: after a sync PR is merged, the PR's head commit (`head.sha`) MUST
+#      be an ancestor of the (post-merge) base branch tip:
+#        * merge commit -> head.sha is the merge's 2nd parent -> ancestor      (OK)
+#        * fast-forward -> head.sha IS the new base tip        -> ancestor      (OK)
+#        * squash       -> a new 1-parent commit               -> NOT ancestor  (BAD)
+#        * rebase       -> replayed commits with new SHAs       -> NOT ancestor  (BAD)
+#   2. `.github/`: `HEAD^1..HEAD` restricted to `.github/` is exactly what merging
+#      this PR changed there (for the sanctioned merge commit, HEAD^1 is the base
+#      tip just before the merge; for a fast-forward, HEAD is the PR's own merge
+#      commit and HEAD^1 is likewise its pre-merge base). A non-empty diff is BAD.
+#      This check is meaningful for the ancestry-preserving merges that check 1
+#      enforces; it runs only after check 1 passes.
+#
+# WHAT IT DOES ON A BAD MERGE
+#   Fails the run and opens (or comments on) a tracking issue (a distinct issue
+#   per invariant, de-duplicated by title). It does NOT auto-revert: reverting a
+#   merge on a shared integration branch is destructive and easy to get wrong, so
+#   that is intentionally left to a maintainer.
+#
+# NOTES / ASSUMPTIONS
+#   * Uses `pull_request_target` so the workflow definition and token come from
+#     the trusted base branch (not from the PR head). Sync branches carry
+#     amd-main's `.github`, so this file is present on every base a sync PR can
+#     target (amd-main, or a lower sync branch when PRs are stacked), and the
+#     guard fires for stacked PRs too.
+#   * No branch files are pushed here, so the default GITHUB_TOKEN is enough; it
+#     needs `issues: write` to file the alert and `contents: read` to inspect
+#     history.
+#   * `refs/pull/<n>/head` is fetched to make the head commit available even
+#     after the PR branch has been deleted by the sync workflow's cleanup step.
+# =============================================================================
+
+name: Sync Merge Guard
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify-merge:
+    # Only act on MERGED sync PRs (head branch under the automation prefix).
+    if: ${{ github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'z_automation/upstream-sync/') }}
+    runs-on: ubuntu-latest
+
+    # Pass event fields via env (NOT interpolated into the script) to avoid any
+    # shell-injection from attacker-controllable values such as the PR title.
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+
+    steps:
+      - name: Checkout base branch (full history)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Verify the merge preserved ancestry
+        run: |
+          set -euo pipefail
+
+          # Make the PR head commit available locally (the branch may already be
+          # gone; refs/pull/<n>/head persists).
+          git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+
+          if git merge-base --is-ancestor "$HEAD_SHA" HEAD; then
+            echo "OK: PR #${PR_NUMBER} head ${HEAD_SHA} is an ancestor of ${BASE_REF}."
+            echo "Merge preserved ancestry (merge commit or fast-forward)."
+            exit 0
+          fi
+
+          echo "::error title=Improper sync merge::PR #${PR_NUMBER} merged into ${BASE_REF} without preserving ancestry (squash/rebase?)."
+
+          TITLE="Sync PR #${PR_NUMBER} merged without a merge commit (ancestry broken)"
+
+          BODY_FILE="$(mktemp)"
+          {
+            echo "**PR #${PR_NUMBER}** (\`${PR_TITLE}\`) was merged into \`${BASE_REF}\`, but its"
+            echo "head commit \`${HEAD_SHA}\` is **not an ancestor** of \`${BASE_REF}\`."
+            echo
+            echo "That means it was merged with **Squash and merge** or **Rebase and merge**,"
+            echo "which rewrite the upstream commits into new SHAs and break the ancestry the"
+            echo "automated sync relies on (see \`.github/workflows/amd-sync-upstream2.yml\`)."
+            echo
+            echo "### Consequences"
+            echo "- The sync workflow's \`git merge-base --is-ancestor\` fast path no longer"
+            echo "  short-circuits; future syncs are computed against a stale merge base."
+            echo "- Expect redundant re-merges, spurious conflicts, and possibly duplicate"
+            echo "  sync PRs until a later sync PR is merged with **Create a merge commit**,"
+            echo "  which re-links the ancestry."
+            echo
+            echo "### Possible fixes"
+            echo "- Immediately create a re-linking commit the base branch manually"
+            echo "  by executing 'git merge -s ours <upstream-tip>' (safe only when the "
+            echo "  already-merged content matches that tip), or"
+            echo "- Revert this merge and re-merge the PR with **Create a merge commit**, or"
+            echo "  let the next correctly-merged sync PR re-establish the ancestry."
+            echo "- Consider disabling Squash/Rebase merging repo-wide"
+            echo "  (Settings -> General -> Pull Requests) to prevent recurrence."
+          } > "$BODY_FILE"
+
+          # De-duplicate: if an open issue with this exact title already exists,
+          # comment on it; otherwise create a new one. Never let a failure here
+          # swallow the non-zero exit below.
+          EXISTING="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 200 \
+            --json number,title 2>/dev/null \
+            | jq -r --arg t "$TITLE" 'map(select(.title == $t)) | .[0].number // empty' || true)"
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" \
+              --body "Re-detected: PR #${PR_NUMBER} head ${HEAD_SHA} is not an ancestor of ${BASE_REF}." \
+              || echo "warning: could not comment on issue #${EXISTING}"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY_FILE" \
+              || echo "warning: could not create tracking issue"
+          fi
+
+          # Fail the run so the bad merge is visible in checks/notifications.
+          exit 1
+
+      # -----------------------------------------------------------------------
+      # Guard: a sync PR must NEVER modify `.github/`. `${BASE_REF}` owns its own
+      # `.github/`, and every sync branch pins `.github/` to the base, so merging
+      # a sync PR must be a no-op there. A non-empty `.github/` delta means upstream
+      # `.github/` leaked in - typically via a manual conflict resolution that let
+      # the upstream side win under `.github/`.
+      # -----------------------------------------------------------------------
+      - name: Verify the merge did not modify .github
+        run: |
+          set -euo pipefail
+
+          # The sanctioned merge is a merge commit (asserted by the step above)
+          # whose first parent is the base tip immediately BEFORE this merge; for a
+          # fast-forward, HEAD is the PR's own merge commit and HEAD^1 is likewise
+          # its pre-merge base. Either way, HEAD^1..HEAD is exactly what merging
+          # this PR changed on `${BASE_REF}`, so restricting it to `.github`
+          # reveals any leak.
+          if ! CHANGED_GITHUB="$(git diff --name-only HEAD^1 HEAD -- .github)"; then
+            echo "::error title=.github guard failed::Could not compute the .github diff for PR #${PR_NUMBER}."
+            exit 1
+          fi
+
+          if [ -z "$CHANGED_GITHUB" ]; then
+            echo "OK: PR #${PR_NUMBER} introduced no changes under .github/."
+            exit 0
+          fi
+
+          echo "::error title=.github modified by sync PR::PR #${PR_NUMBER} changed files under .github/, which is not permitted for sync PRs."
+          echo "Changed paths under .github/:"
+          printf '%s\n' "$CHANGED_GITHUB"
+
+          TITLE="Sync PR #${PR_NUMBER} modified .github/ (not permitted)"
+
+          BODY_FILE="$(mktemp)"
+          {
+            echo "**PR #${PR_NUMBER}** (\`${PR_TITLE}\`) was merged into \`${BASE_REF}\` but it"
+            echo "**modified files under \`.github/\`**:"
+            echo
+            echo '```'
+            printf '%s\n' "$CHANGED_GITHUB"
+            echo '```'
+            echo
+            echo "Modification of \`.github\` directory is NOT permitted for synchronization"
+            echo "PRs. If you only tried to improve existing CI files, use a separate PR for that."
+            echo
+            echo "\`${BASE_REF}\` owns its \`.github/\` directory and every sync branch pins it to"
+            echo "the base, so a sync merge must be a no-op there. A non-empty delta usually"
+            echo "means a manual conflict resolution accidentally let the upstream \`.github/\`"
+            echo "side leak in (see \`.github/workflows/amd-sync-upstream2.yml\`)."
+            echo
+            echo "### Possible fixes"
+            echo "- Restore \`.github/\` on \`${BASE_REF}\` to its pre-merge state, or"
+            echo "- Open a separate, dedicated PR for any intended CI changes."
+          } > "$BODY_FILE"
+
+          # De-duplicate: if an open issue with this exact title already exists,
+          # comment on it; otherwise create a new one. Never let a failure here
+          # swallow the non-zero exit below.
+          EXISTING="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 200 \
+            --json number,title 2>/dev/null \
+            | jq -r --arg t "$TITLE" 'map(select(.title == $t)) | .[0].number // empty' || true)"
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" \
+              --body "Re-detected: PR #${PR_NUMBER} modified .github/ on ${BASE_REF}." \
+              || echo "warning: could not comment on issue #${EXISTING}"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY_FILE" \
+              || echo "warning: could not create tracking issue"
+          fi
+
+          # Fail the run so the .github leak is visible in checks/notifications.
+          exit 1
