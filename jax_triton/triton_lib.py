@@ -38,7 +38,6 @@ from jax._src import util
 from jax._src.frozen_dict import FrozenDict
 from jax._src.interpreters import partial_eval as pe
 from jax._src.lib import gpu_triton as triton_kernel_call_lib
-from jax._src.pallas.triton import gpu_info
 import jax.extend as jex
 from jax.interpreters import ad
 from jax.interpreters import batching
@@ -55,15 +54,19 @@ import triton.language as tl
 import triton.runtime.autotuner as autotuner
 
 try:
+  from jax._src.pallas.triton import gpu_info  # pyrefly: ignore[missing-module-attribute]
+except ImportError:
+  gpu_info = None  # Only available in JAX 0.11.0+.
+
+try:
   import triton.backends.nvidia.compiler as cb
 except ImportError:
-  cb = None  # NVIDIA backend is not available.
+  cb: Any = None  # NVIDIA backend is not available.
 
 try:
   import triton.backends.amd.compiler as hb
 except ImportError:
-  hb = None  # AMD backend is not available.
-
+  hb: Any = None  # AMD backend is not available.
 
 # TODO(slebedev): Investigate if this is necessary.
 if "TRITON_CACHE_DIR" in os.environ:
@@ -122,7 +125,7 @@ def normalize_grid(grid: ValueOrFn[Grid], metaparams) -> tuple[int, int, int]:
     grid = (grid,)
   elif len(grid) > 3:
     raise ValueError("`grid` should have three or fewer dimensions.")
-  return tuple(grid) + (1,) * (3 - len(grid))
+  return tuple(grid) + (1,) * (3 - len(grid))  # pyrefly: ignore[bad-return]
 
 
 def get_type_id(obj: Any) -> str:
@@ -388,8 +391,8 @@ def compile_ttir_to_hsaco_inplace(
 
 
 def make_backend(
-  make_gpu_target_func, compute_capability: int | None, num_ctas: int
-) -> tuple[tc.BaseBackend, tc.GPUTarget, int]:
+    make_gpu_target_func, compute_capability: int | None, num_ctas: int
+) -> tuple[cb.CUDABackend | hb.HIPBackend, tc.GPUTarget, int]:
   """Resolves compute_capability and creates Triton's Backend and GPUTarget objects."""
 
   # TODO(sharadmv): handle multiple devices, right now we assume device 0
@@ -403,6 +406,8 @@ def make_backend(
     try:
       compute_capability = triton_kernel_call_lib.get_compute_capability(device)
     except RuntimeError:
+      if gpu_info is None:
+        raise
       # TODO(slebedev): Consider *only* using ``gpu_info`` here.
       compute_capability = gpu_info.get_gpu_info().compute_capability
   if num_ctas > 1 and compute_capability < 90:
@@ -491,25 +496,19 @@ class JTJITFunction:
     return len(self.fn._jT_kernel_cache) if hasattr(self.fn, "_jT_kernel_cache") else 0
 
   def get_or_create_triton_kernel(
-    self,
-    make_gpu_target_func,
-    platform,
-    arg_dtypes,
-    scalar_args,
-    *,
-    num_warps,
-    num_stages,
-    num_ctas,
-    compute_capability,
-    enable_fp_fusion,
-    metaparams,
-    dump: bool,
+      self,
+      make_gpu_target_func,
+      platform,
+      arg_dtypes,
+      scalar_args,
+      *,
+      compute_capability,
+      backend_options: Mapping[str, Any],
+      metaparams,
   ) -> tuple[triton_kernel_call_lib.TritonKernel, Any]:
     fn = self.fn
-    if num_warps is None:
-      num_warps = 4
-    if num_stages is None:
-      num_stages = 3
+    num_warps = backend_options["num_warps"]
+    num_ctas = backend_options["num_ctas"]
 
     backend, gpu_target, compute_capability = make_backend(
       make_gpu_target_func, compute_capability, num_ctas
@@ -522,7 +521,7 @@ class JTJITFunction:
     alignments = [16] * len(arg_dtypes)
     for i, _, _ in scalar_args:
       alignments[i] = 0
-    specialize_impl = _triton.native_specialize_impl
+    specialize_impl = _triton.native_specialize_impl  # pyrefly: ignore[missing-attribute]
     is_const = False
     do_specialize = True
     specialization = [
@@ -548,19 +547,17 @@ class JTJITFunction:
 
     # Cache key should contain any parameter that can affect the compiler output.
     cache_key = (
-      fn,
-      tuple(signature.items()),
-      tuple(specialization),
-      tuple(constants.items()),
-      num_warps,
-      num_stages,
-      num_ctas,
-      compute_capability,
-      enable_fp_fusion,
+        fn,
+        tuple(signature.items()),
+        tuple(specialization),
+        tuple(constants.items()),
+        compute_capability,
+        tuple(sorted(backend_options.items())),
     )
     if not hasattr(self.fn, "_jT_kernel_cache"):
-      self.fn._jT_kernel_cache = {}  # TODO(cjfj): Convert to LRU cache?
-    kernel = self.fn._jT_kernel_cache.get(cache_key)
+      # TODO(cjfj): Convert to LRU cache?
+      self.fn._jT_kernel_cache = {}  # pyrefly: ignore[missing-attribute]
+    kernel = self.fn._jT_kernel_cache.get(cache_key)  # pyrefly: ignore[missing-attribute]
 
     if kernel is None:
       # First, check that the kernel signature and the reconstructed signature have the
@@ -576,16 +573,7 @@ class JTJITFunction:
           "implicit output arguments are no longer required for aliased arguments."
         )
 
-      opts = {
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        "num_ctas": num_ctas,
-        "optimize_epilogue": False,
-        "debug": dump,
-        "enable_fp_fusion": enable_fp_fusion,
-      }
-
-      options = backend.parse_options(opts)
+      options = backend.parse_options(backend_options)  # pyrefly: ignore[bad-argument-type]
 
       kernel_hash = abs(hash(cache_key))
       if _JAX_TRITON_DUMP_DIR:
@@ -594,8 +582,8 @@ class JTJITFunction:
           pprint.pprint(cache_key, stream=f)
           pprint.pprint(options, stream=f)
 
-      context = _triton.ir.context()
-      _triton.ir.load_dialects(context)
+      context = _triton.ir.context()  # pyrefly: ignore[missing-attribute]
+      _triton.ir.load_dialects(context)  # pyrefly: ignore[missing-attribute]
       backend.load_dialects(context)
       codegen_fns = backend.get_codegen_implementation(options)
 
@@ -647,15 +635,15 @@ class JTJITFunction:
         compute_capability,
       )
 
-      self.fn._jT_kernel_cache[cache_key] = kernel
+      self.fn._jT_kernel_cache[cache_key] = kernel  # pyrefly: ignore[missing-attribute]
 
     return kernel, attrs
 
 
 def make_autotuner_configs(
-  fn: autotuner.Autotuner,
-  kwargs: dict[str, Any],
-  named_args: dict[str, Any],
+    fn: autotuner.Autotuner,
+    kwargs: Mapping[str, Any],
+    named_args: Mapping[str, Any],
 ) -> list[triton.Config]:
   """Make and prune redundant autotuner configs based on user-provided kwargs.
 
@@ -689,16 +677,16 @@ def make_autotuner_configs(
     return pruned_configs
 
   fn.early_config_prune = prune_configs
-  fn.nargs = named_args
-  configs = fn.prune_configs(kwargs)
+  fn.nargs = named_args  # pyrefly: ignore[bad-assignment]
+  configs = fn.prune_configs(kwargs)  # pyrefly: ignore[bad-argument-type]
   return configs
 
 
 def apply_heuristics(
-  fn: autotuner.Heuristics,
-  configs: list[triton.Config],
-  orig_kwargs: dict[str, Any],
-  named_args: dict[str, Any],
+    fn: autotuner.Heuristics,
+    configs: list[triton.Config],
+    orig_kwargs: Mapping[str, Any],
+    named_args: Mapping[str, Any],
 ) -> list[triton.Config]:
   """Applies heuristics to the configs and returns the updated configs."""
   updated_configs = []
@@ -721,14 +709,10 @@ def triton_kernel_call_lowering(
     name,
     out_shapes,
     grid,
-    num_warps,
-    num_stages,
-    num_ctas,
     compute_capability,
-    enable_fp_fusion,
+    backend_options: FrozenDict[str, Any],
     input_output_aliases: FrozenDict[int, int],
     zeroed_outputs,
-    debug,
     serialized_metadata,
     metaparams: FrozenDict[str, Any],
     has_side_effect: bool = False,
@@ -755,10 +739,10 @@ def triton_kernel_call_lowering(
     fn = fn.fn
   else:
     config = triton.Config(
-      {},
-      num_warps=num_warps,
-      num_stages=num_stages,
-      num_ctas=num_ctas,
+        {},
+        num_warps=backend_options["num_warps"],
+        num_stages=backend_options["num_stages"],
+        num_ctas=backend_options["num_ctas"],
     )
     configs = [config]
 
@@ -806,18 +790,20 @@ def triton_kernel_call_lowering(
         for i in sorted(config_zeroed_outputs)
     }
 
+    config_backend_options = {
+        **backend_options,
+        "num_warps": config.num_warps,
+        "num_stages": config.num_stages,
+        "num_ctas": config.num_ctas,
+    }
     kernel, specialization_attr = jtfu.get_or_create_triton_kernel(
         make_gpu_target_func,
         ctx.module_context.platforms[0],
         arg_dtypes,
         scalar_args,
-        num_warps=config.num_warps,
-        num_stages=config.num_stages,
-        num_ctas=config.num_ctas,
         compute_capability=compute_capability,
-        enable_fp_fusion=enable_fp_fusion,
+        backend_options=config_backend_options,
         metaparams=config_metaparams,
-        dump=debug,
     )
 
     kernel_params = []
@@ -931,9 +917,10 @@ def triton_call(
     name: str = "",
     num_warps: int | None = None,
     num_stages: int | None = None,
-    num_ctas: int = 1,  # TODO(giorgioa): Add support for dimensions tuple.
+    # TODO(giorgioa): Add support for dimensions tuple.
+    num_ctas: int | None = None,
     compute_capability: int | None = None,
-    enable_fp_fusion: bool = True,
+    backend_options: Mapping[str, Any] | None = None,
     input_output_aliases: dict[int, int] | None = None,
     zeroed_outputs: ValueOrFn[Sequence[int]] = (),
     debug: bool = False,
@@ -1008,8 +995,6 @@ def triton_call(
       tuple of up to 3 integers.
     name: A name for the kernel call.
     compute_capability: The GPU compute capability to compile for.
-    enable_fp_fusion: Whether to enable floating-point operation fusion in the
-      Triton compiler.
     input_output_aliases: A dictionary mapping input argument indices to output
       indices. Providing a mapping will alias the corresponding buffers. The
       input indices are positions in the original ``*args``.
@@ -1023,6 +1008,10 @@ def triton_call(
     num_ctas: The size of thread blocks per cluster to be used on GPUs with
       compute capabilities >= 9.0. It must be less or equal to 8.
     debug: Prints out intermediate IRs if True for debugging purposes.
+    backend_options: A mapping of backend-specific compiler options. The
+      available options depend on the Triton backend. The ``num_warps``,
+      ``num_stages``, ``num_ctas`` and ``debug`` are merged into this mapping.
+      It is an error to specify the same option in both.
     serialized_metadata: Arbitrary metadata that will be added into the
       serialized kernel call.
     has_side_effect: Whether the Triton kernel has side effects.
@@ -1032,6 +1021,29 @@ def triton_call(
   Returns:
     Outputs from the Triton kernel.
   """
+  if backend_options is None:
+    backend_options = {}
+  explicit_options = {
+      "num_warps": num_warps,
+      "num_stages": num_stages,
+      "num_ctas": num_ctas,
+      "debug": debug,
+  }
+  del num_ctas, num_stages, num_warps, debug
+  for k, v in list(explicit_options.items()):
+    if v is None:
+      del explicit_options[k]
+
+  if conflicts := explicit_options.keys() & backend_options.keys():
+    raise ValueError(
+        f"Cannot specify {conflicts} both as explicit arguments and in"
+        " ``backend_options``"
+    )
+  backend_options = {**backend_options, **explicit_options}
+  backend_options.setdefault("num_warps", 4)
+  backend_options.setdefault("num_stages", 3)
+  backend_options.setdefault("num_ctas", 1)
+
   out_shape = tree_util.tree_map(
       lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape
   )
@@ -1059,14 +1071,10 @@ def triton_call(
       name=name,
       out_shapes=tuple(flat_out_shapes),
       grid=grid,
-      num_warps=num_warps,
-      num_stages=num_stages,
-      num_ctas=num_ctas,
       compute_capability=compute_capability,
-      enable_fp_fusion=enable_fp_fusion,
+      backend_options=FrozenDict(backend_options),
       input_output_aliases=FrozenDict(input_output_aliases),
       zeroed_outputs=zeroed_outputs,
-      debug=debug,
       serialized_metadata=serialized_metadata,
       has_side_effect=has_side_effect,
       metaparams=FrozenDict(metaparams),
